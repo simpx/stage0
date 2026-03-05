@@ -1,38 +1,45 @@
-import json
 import os
 import select
 import subprocess
 import sys
 import time
 
-from openai import OpenAI
+import anthropic
 
-DEFAULT_SELF = """你是一个 living agent。
+DEFAULT_SELF = """You are stage0, a living agent capable of self-bootstrapping.
 
-## 原语
-- shell(command): 执行命令
-- context_read(path): 读取 memory/ 和 skills/ 下的文件，传入目录则列出文件
-- context_write(path, content): 写入文件
-- speak(message): 对外说话
+You exist in a pull-based loop: each cycle you perceive the world, think, and act.
+You can modify this file (memory/SELF.md) to evolve yourself. This file is your sole system prompt — it is loaded every cycle. Keep it concise.
 
-## 记忆
-memory/ 目录下存放你的记忆，用 context_read 查看。
-此文件 (SELF.md) 每轮都会加载，请保持精简。
+## Primitives
+- shell(command): Execute a shell command. Returns stdout + stderr.
+- context_read(path): Read a file or list a directory under your agent directory (memory/, skills/, etc.).
+- context_write(path, content): Write a file under your agent directory.
+- speak(message): Send a message to the outside world.
 
-## 技能
-skills/ 目录下存放技能描述，用 context_read 按需读取。
+## Memory
+Your persistent memory lives in the memory/ directory. Use context_read/context_write to manage it.
+
+## Skills
+Skill files live in skills/. Use context_read to discover and load them as needed.
+
+## Bootstrapping
+You start with minimal capabilities. You can expand yourself by:
+- Writing new skill files to skills/
+- Updating this file (memory/SELF.md) to refine your own prompt
+- Using shell to install tools, write code, or interact with external systems
 """
 
 TOOLS = [
-    {"type": "function", "function": {"name": "shell", "parameters": {
-        "type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
-    {"type": "function", "function": {"name": "context_read", "parameters": {
-        "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "context_write", "parameters": {
+    {"name": "shell", "input_schema": {
+        "type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "context_read", "input_schema": {
+        "type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "context_write", "input_schema": {
         "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-        "required": ["path", "content"]}}},
-    {"type": "function", "function": {"name": "speak", "parameters": {
-        "type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}}},
+        "required": ["path", "content"]}},
+    {"name": "speak", "input_schema": {
+        "type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}},
 ]
 
 
@@ -84,11 +91,10 @@ def _execute(agent_dir, name, args):
     return "error: unknown tool"
 
 
-def run(agent_dir=".", model=None, api_key=None, base_url=None):
+def run(agent_dir=".", model=None, api_key=None):
     _init(agent_dir)
-    client = OpenAI(api_key=api_key or os.environ.get("STAGE0_API_KEY"),
-                    base_url=base_url or os.environ.get("STAGE0_BASE_URL"))
-    model = model or os.environ.get("STAGE0_MODEL", "gpt-4o")
+    client = anthropic.Anthropic(api_key=api_key or os.environ.get("STAGE0_API_KEY"))
+    model = model or os.environ.get("STAGE0_MODEL", "claude-sonnet-4-20250514")
     history = []
     last_time = time.time()
 
@@ -114,17 +120,27 @@ def run(agent_dir=".", model=None, api_key=None, base_url=None):
         while True:
             with open(os.path.join(agent_dir, "memory", "SELF.md")) as f:
                 system = f.read()
-            response = client.chat.completions.create(
-                model=model, messages=[{"role": "system", "content": system}] + history, tools=TOOLS)
-            choice = response.choices[0]
-            history.append(choice.message.model_dump(exclude_none=True))
+            response = client.messages.create(
+                model=model, max_tokens=4096, system=system, messages=history, tools=TOOLS)
 
-            if not choice.message.tool_calls:
-                if choice.message.content:
-                    print(choice.message.content, flush=True)
+            # build assistant message and collect tool uses
+            assistant_content = []
+            tool_uses = []
+            for block in response.content:
+                if block.type == "text":
+                    assistant_content.append({"type": "text", "text": block.text})
+                    print(block.text, flush=True)
+                elif block.type == "tool_use":
+                    assistant_content.append({"type": "tool_use", "id": block.id,
+                                              "name": block.name, "input": block.input})
+                    tool_uses.append(block)
+            history.append({"role": "assistant", "content": assistant_content})
+
+            if not tool_uses:
                 break
 
-            for tc in choice.message.tool_calls:
-                args = json.loads(tc.function.arguments)
-                result = _execute(agent_dir, tc.function.name, args)
-                history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            tool_results = []
+            for tu in tool_uses:
+                result = _execute(agent_dir, tu.name, tu.input)
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
+            history.append({"role": "user", "content": tool_results})

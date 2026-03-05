@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A living agent that pulls the world and evolves itself"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["openai>=1.0"]
+dependencies = ["anthropic>=0.40"]
 
 [project.scripts]
-stage0 = "stage0.loop:run"
+stage0 = "stage0:run"
