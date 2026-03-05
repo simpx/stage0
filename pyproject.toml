@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "stage0"
+version = "0.1.0"
+description = "A living agent that pulls the world and evolves itself"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["openai>=1.0"]
+
+[project.scripts]
+stage0 = "stage0.loop:run"
