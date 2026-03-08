@@ -98,7 +98,8 @@ def run(agent_dir=".", model=None, api_key=None):
     history = []
     last_time = time.time()
 
-    while True:
+    stdin_alive = True
+    while stdin_alive:
         # pull
         elapsed = time.time() - last_time
         last_time = time.time()
@@ -110,6 +111,7 @@ def run(agent_dir=".", model=None, api_key=None):
             if line:
                 parts.append(line.rstrip("\n"))
             else:
+                stdin_alive = False
                 break
         if not parts:
             time.sleep(0.5)

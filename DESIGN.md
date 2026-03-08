@@ -129,7 +129,7 @@ echo "message 2" > /tmp/agent_in
 stage0_researcher | stage0_coder
 ```
 
-**Key detail**: the agent loops as long as stdin is open. `echo` sends one message then closes the pipe — the agent processes it but then idles. For sustained interaction, use interactive mode, `tail -f`, or a FIFO.
+**Key detail**: stdin is the agent's lifeline. When stdin closes (EOF), the agent finishes its current work and exits — it "dies". `echo` sends one message then closes the pipe, so the agent processes it and exits. For a living agent, keep stdin open: interactive mode, `tail -f`, or a FIFO.
 
 This makes stage0 composable. It's a Unix citizen — it can be piped, backgrounded, chained, and orchestrated.
 
