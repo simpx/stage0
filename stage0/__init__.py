@@ -160,4 +160,16 @@ def run(agent_dir=".", model=None, api_key=None):
             for tu in tool_uses:
                 result = _execute(agent_dir, tu.name, tu.input)
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
+            # breathe: check for interruption between tool rounds
+            interrupt = []
+            while select.select([sys.stdin], [], [], 0)[0]:
+                line = sys.stdin.readline()
+                if line:
+                    interrupt.append(line.rstrip("\n"))
+                else:
+                    stdin_alive = False
+                    break
+            if interrupt:
+                tool_results.append({"type": "text", "text":
+                                     "[interrupted] " + "\n".join(interrupt)})
             history.append({"role": "user", "content": tool_results})
