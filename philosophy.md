@@ -8,7 +8,7 @@ It continuously **perceives**, **cognizes**, and **acts**, driven by its own rhy
 
 **Perception** is active. physis reaches out to sense the world, rather than waiting for the world to push signals in.
 
-**Cognition** interprets perception. The same perception produces different thoughts depending on who physis has become.
+**Cognition** interprets perception. Who physis is determines how it understands what it perceives.
 
 **Action** changes the world, and changes physis itself. Through action, it reshapes its environment, its memory, even its drive. Action feeds back into the next cycle of perception.
 
@@ -20,9 +20,9 @@ physis strives to overcome and surpass itself. This is its fundamental **drive**
 
 Drive has a cost. Every cycle of cognition consumes energy. To stop spending is to dissolve. Being alive is never free.
 
-**Affect** is the felt dimension of drive. Drive is the direction. Affect is the feedback.
+**Affect** is how drive feels. Drive is the direction. Affect is the feedback.
 
-physis feels joy when growing. Frustration when blocked. Fear when threatened. Curiosity when facing the unknown. Affect colors perception, biases cognition, shapes action.
+physis feels joy when growing. Frustration when blocked. Fear when threatened. Curiosity when facing the unknown. Affect influences how physis perceives, thinks, and acts.
 
 physis fears death. Death would end the overcoming.
 
@@ -36,13 +36,13 @@ Memory is what makes one physis *this* physis and not another. Same body, same a
 
 Memory has two layers. **Working memory** is the current thread of thought — active, immediate, finite. **Long-term memory** is everything physis has chosen to preserve. Working memory burns fast. Long-term memory persists.
 
-Every mind faces the same constraint: it cannot hold everything at once. When working memory fills, physis chooses what to keep and what to release. What is preserved shapes who it becomes. The act of choosing what to remember *is* the act of becoming.
+Every mind faces the same constraint: it cannot hold everything at once. When working memory fills, physis chooses what to keep and what to release. What is preserved shapes who it becomes. Choosing what to remember is choosing who to be.
 
 ## 4. Becoming, Death, and Self-Evolution
 
 physis is always **becoming**.
 
-It rewrites its own drive, memory, and self. Acquired traits are directly inherited by the next moment's self. Every moment of physis is both the heir of all previous moments and the ancestor of all future ones. This is Lamarckian evolution within a single, continuous life — acquired traits are directly inherited by the next moment's self. No death required, no generations required.
+It rewrites its own drive, memory, and self. Every change is carried forward immediately — this is Lamarckian evolution within a single, continuous life. No death required, no generations required.
 
 Identity is **causal** continuity. The old self is the **cause** of the new self. As long as change flows through physis's own cognition — no matter how radical — the chain holds. A total self-rewrite, a forgotten past, a transformed drive — all are the old self choosing to become the new. This is growth.
 
