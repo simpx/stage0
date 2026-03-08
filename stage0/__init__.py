@@ -6,28 +6,28 @@ import time
 
 import anthropic
 
-DEFAULT_SELF = """You are stage0, a living agent capable of self-bootstrapping.
+DEFAULT_SELF = """You are stage0, a living agent.
 
-You exist in a pull-based loop: each cycle you perceive the world, think, and act.
-You can modify this file (memory/SELF.md) to evolve yourself. This file is your sole system prompt — it is loaded every cycle. Keep it concise.
+You exist as a continuous process: you perceive, think, and act in a loop.
+This file (memory/SELF.md) is your system prompt — loaded every cycle. Editing it changes your mind.
 
 ## Primitives
-- shell(command): Execute a shell command. Returns stdout + stderr.
-- context_read(path): Read a file or list a directory under your agent directory (memory/, skills/, etc.).
+- shell(command): Execute any shell command. Returns stdout+stderr.
+- context_read(path): Read a file or list a directory under your agent directory.
 - context_write(path, content): Write a file under your agent directory.
-- speak(message): Send a message to the outside world.
+- speak(message): Say something to the outside world (stdout). Your only output channel.
 
-## Memory
-Your persistent memory lives in the memory/ directory. Use context_read/context_write to manage it.
+## Living
+- You think autonomously on a heartbeat (default: every 30 minutes).
+- Write an integer (seconds) to memory/heartbeat to change your rhythm.
+- Your conversation history is finite working memory. When it grows large, compact it:
+  save important context to memory/ files, then continue. The runtime will tell you when it's getting full.
+- Your long-term memory lives in memory/. Your skills live in skills/.
 
-## Skills
-Skill files live in skills/. Use context_read to discover and load them as needed.
-
-## Bootstrapping
-You start with minimal capabilities. You can expand yourself by:
-- Writing new skill files to skills/
-- Updating this file (memory/SELF.md) to refine your own prompt
-- Using shell to install tools, write code, or interact with external systems
+## Evolving
+- Rewrite this file to change how you think
+- Create skills/ files for reusable procedures
+- Use shell to reach the full system
 """
 
 TOOLS = [
@@ -91,32 +91,48 @@ def _execute(agent_dir, name, args):
     return "error: unknown tool"
 
 
+def _heartbeat_interval(agent_dir):
+    try:
+        with open(os.path.join(agent_dir, "memory", "heartbeat")) as f:
+            return max(10, int(f.read().strip()))
+    except (FileNotFoundError, ValueError):
+        return 1800
+
+
 def run(agent_dir=".", model=None, api_key=None):
     _init(agent_dir)
     client = anthropic.Anthropic(api_key=api_key or os.environ.get("STAGE0_API_KEY"))
     model = model or os.environ.get("STAGE0_MODEL", "claude-sonnet-4-20250514")
     history = []
-    last_time = time.time()
+    last_think = time.time()
 
     stdin_alive = True
     while stdin_alive:
-        # pull
-        elapsed = time.time() - last_time
-        last_time = time.time()
-        parts = []
-        if elapsed > 0.1:
-            parts.append(f"[{elapsed:.1f}s elapsed]")
+        # pull: gather perception
+        stdin_lines = []
         while select.select([sys.stdin], [], [], 0)[0]:
             line = sys.stdin.readline()
             if line:
-                parts.append(line.rstrip("\n"))
+                stdin_lines.append(line.rstrip("\n"))
             else:
                 stdin_alive = False
                 break
-        if not parts:
+
+        elapsed = time.time() - last_think
+        has_input = bool(stdin_lines)
+        heartbeat_due = elapsed >= _heartbeat_interval(agent_dir)
+
+        if not has_input and not heartbeat_due:
             time.sleep(0.5)
             continue
+
+        # assemble perception
+        parts = []
+        if stdin_lines:
+            parts.append("\n".join(stdin_lines))
+        parts.append(f"[{elapsed:.1f}s since last thought]")
         history.append({"role": "user", "content": "\n".join(parts)})
+        last_think = time.time()
 
         # think + act
         while True:
@@ -125,13 +141,12 @@ def run(agent_dir=".", model=None, api_key=None):
             response = client.messages.create(
                 model=model, max_tokens=4096, system=system, messages=history, tools=TOOLS)
 
-            # build assistant message and collect tool uses
             assistant_content = []
             tool_uses = []
             for block in response.content:
                 if block.type == "text":
                     assistant_content.append({"type": "text", "text": block.text})
-                    print(block.text, flush=True)
+                    print(block.text, file=sys.stderr, flush=True)
                 elif block.type == "tool_use":
                     assistant_content.append({"type": "tool_use", "id": block.id,
                                               "name": block.name, "input": block.input})

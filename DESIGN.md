@@ -15,64 +15,76 @@ Every person can launch a `stage0` and give it a direction. The agent will:
 1. Understand itself by reading its own prompt (`memory/SELF.md`)
 2. Act on the world through minimal primitives
 3. Rewrite its own prompt and create skill files to evolve
-4. Loop forever — a living process, not a request-response tool
+4. Loop as long as alive — a living process, not a request-response tool
 
 This is not a framework. It's a seed.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│                  stage0 loop                 │
-│                                             │
-│   ┌─────────┐   ┌─────────┐   ┌─────────┐  │
-│   │  pull   │──▶│  think  │──▶│   act   │  │
-│   │ (stdin) │   │ (Claude)│   │ (tools) │  │
-│   └─────────┘   └─────────┘   └─────────┘  │
-│       ▲                            │        │
-│       └────────────────────────────┘        │
-│                                             │
-│   ┌─────────────────────────────────────┐   │
-│   │         agent_dir (filesystem)      │   │
-│   │                                     │   │
-│   │  memory/SELF.md  ← system prompt    │   │
-│   │  memory/*        ← persistent state │   │
-│   │  skills/*        ← learned skills   │   │
-│   └─────────────────────────────────────┘   │
-│                                             │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│                  stage0 loop                  │
+│                                              │
+│   ┌─────────┐   ┌─────────┐   ┌──────────┐  │
+│   │  pull   │──▶│  think  │──▶│   act    │  │
+│   │ (stdin  │   │ (Claude)│   │  (tools) │  │
+│   │  +time) │   └────┬────┘   └──────────┘  │
+│   └─────────┘        │              │        │
+│       ▲              │ text         │        │
+│       │              ▼ (stderr)     │        │
+│       └─────────────────────────────┘        │
+│                                              │
+│   ┌──────────────────────────────────────┐   │
+│   │         agent_dir (filesystem)       │   │
+│   │                                      │   │
+│   │  memory/SELF.md   ← system prompt    │   │
+│   │  memory/heartbeat ← thinking rhythm  │   │
+│   │  memory/*         ← long-term memory │   │
+│   │  skills/*         ← learned skills   │   │
+│   └──────────────────────────────────────┘   │
+│                                              │
+└──────────────────────────────────────────────┘
         ▲              │
-        │ stdin         │ stdout (speak)
+        │ stdin         │ stdout (speak only)
         │              ▼
     [ human / pipe / other agent ]
 ```
 
 ## The Pull-Think-Act Loop
 
-Unlike request-response agents, stage0 runs a **continuous pull loop**:
+stage0 is not request-response. The agent has its own **heartbeat**:
 
 ```
-while True:
-    perception = pull()      # non-blocking stdin + elapsed time
-    if nothing_new: sleep(); continue
-    response = think(perception)  # Claude API with self-evolving system prompt
-    act(response)            # execute tool calls, loop if needed
+while alive:
+    stdin_input = poll_stdin()        # non-blocking, accumulates lines
+    heartbeat_due = elapsed >= interval  # default 30min, agent-configurable
+    if not stdin_input and not heartbeat_due: sleep(0.5); continue
+    perception = assemble(stdin_input, elapsed)
+    response = think(perception)
+    act(response)
 ```
+
+Two things trigger thought: **input** (stdin) and **time** (heartbeat). The agent can adjust its own heartbeat by writing to `memory/heartbeat`.
 
 ### Pull (Perception)
-- Non-blocking read from **stdin** via `select()`
-- Time awareness: elapsed seconds since last cycle
-- No terminal UI — stdin/stdout is the interface. Pipe-friendly by design.
+- Non-blocking read from **stdin** via `select()` — lines accumulate between think cycles
+- Time awareness: elapsed seconds since last thought, included in every perception
+- stdin is a perception stream, not a message queue. Multiple lines become one perception batch.
 
 ### Think (Cognition)
 - System prompt loaded from `memory/SELF.md` **every cycle** — so self-edits take effect immediately
-- Full conversation history maintained in-process
+- Conversation history is **working memory** — finite, must be compacted when full
 - Claude API with tool definitions
 
 ### Act (Agency)
 - Tool calls executed, results fed back
 - Inner loop continues until the model stops calling tools
 - Then back to pull
+
+### Heartbeat
+- Default interval: **30 minutes** (aligns with Anthropic's ~1hr prompt cache — idle thought is cheap)
+- Agent can change it: `context_write("memory/heartbeat", "60")` → think every minute
+- Minimum: 10 seconds (enforced by runtime to prevent runaway costs)
 
 ## Four Primitives
 
@@ -83,11 +95,13 @@ The entire tool surface is four functions:
 | `shell(command)` | Execute any shell command. The escape hatch to the full system. |
 | `context_read(path)` | Read a file or list a directory within the agent directory. |
 | `context_write(path, content)` | Write a file within the agent directory. |
-| `speak(message)` | Output a message to stdout (the human or upstream pipe). |
+| `speak(message)` | Say something to stdout — the agent's **only** outward voice. |
 
 **Why so few?** Because `shell` is universal — the agent can install packages, write code, call APIs, run other agents. The other three provide safe, scoped access to the agent's own filesystem. `speak` is the only output channel.
 
 **Why not just shell?** `context_read`/`context_write` are sandboxed to the agent directory. They make the common case (self-modification) safe and explicit, while `shell` remains the unrestricted escape hatch.
+
+**speak vs text**: The model produces two kinds of output. `speak` goes to **stdout** — it's the agent's mouth, what flows through pipes. Text blocks go to **stderr** — the agent's inner monologue, visible for debugging but not part of the communication channel. This keeps pipes clean: `stage0_researcher | stage0_coder` only passes deliberate speech.
 
 ## Self-Evolution Mechanism
 
@@ -107,38 +121,46 @@ The agent literally rewrites its own brain.
 
 ## I/O Design: Pipes Over TUI
 
-stage0 deliberately uses **stdin/stdout** instead of a terminal UI:
+stage0 deliberately uses **stdin/stdout/stderr** instead of a terminal UI:
+
+- **stdin** → perception (input stream)
+- **stdout** → speech (`speak` tool only — the agent's deliberate voice)
+- **stderr** → inner monologue (model text blocks — for debugging/observation)
 
 ```bash
-# Interactive — stdin stays open, continuous conversation
+# Interactive — see both speech and thoughts
 python -m stage0
 
-# One-shot task — echo closes stdin after one message, agent processes then idles
-echo "Build me a web scraper for HN" | python -m stage0
-
-# Continuous pipe — tail -f keeps stdin open for ongoing input
-tail -f inbox.txt | python -m stage0
-
-# Named pipe (FIFO) — multiple writers, agent stays alive
-mkfifo /tmp/agent_in
-python -m stage0 < /tmp/agent_in &
-echo "message 1" > /tmp/agent_in
-echo "message 2" > /tmp/agent_in
-
-# Chain agents — one agent's stdout feeds another's stdin
+# Pipe — only speech flows downstream, thoughts stay on terminal
 stage0_researcher | stage0_coder
+
+# Silence thoughts
+stage0 2>/dev/null
+
+# Log thoughts to file
+stage0 2>thoughts.log
 ```
 
-**Key detail**: stdin is the agent's lifeline. When stdin closes (EOF), the agent finishes its current work and exits — it "dies". `echo` sends one message then closes the pipe, so the agent processes it and exits. For a living agent, keep stdin open: interactive mode, `tail -f`, or a FIFO.
+**stdin is the agent's lifeline.** When stdin closes (EOF), the agent finishes its current work and exits — it "dies". `echo` sends one message then closes the pipe. For a living agent, keep stdin open: interactive mode, `tail -f`, or a FIFO.
 
 This makes stage0 composable. It's a Unix citizen — it can be piped, backgrounded, chained, and orchestrated.
+
+## Memory Model
+
+| Layer | Mechanism | Capacity | Lifetime |
+|-------|-----------|----------|----------|
+| Working memory | conversation history | context window | single process |
+| Long-term memory | `memory/` files | disk | permanent |
+
+The agent's conversation history is finite working memory. When it grows large, the agent should **compact**: save important context to `memory/` files, then the runtime can trim old history. The DEFAULT_SELF seed teaches this survival skill.
 
 ## File Layout
 
 ```
 agent_dir/              # defaults to current directory
 ├── memory/
-│   └── SELF.md         # the living system prompt (seed provided on first run)
+│   ├── SELF.md         # the living system prompt (seed provided on first run)
+│   └── heartbeat       # optional: thinking interval in seconds (default 1800)
 ├── skills/             # agent-created skill files
 └── (anything the agent creates via shell)
 ```
