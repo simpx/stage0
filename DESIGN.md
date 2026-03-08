@@ -110,18 +110,26 @@ The agent literally rewrites its own brain.
 stage0 deliberately uses **stdin/stdout** instead of a terminal UI:
 
 ```bash
-# Interactive use
+# Interactive — stdin stays open, continuous conversation
 python -m stage0
 
-# Pipe a task
+# One-shot task — echo closes stdin after one message, agent processes then idles
 echo "Build me a web scraper for HN" | python -m stage0
 
-# Chain agents
-stage0_researcher | stage0_coder
-
-# File-based input
+# Continuous pipe — tail -f keeps stdin open for ongoing input
 tail -f inbox.txt | python -m stage0
+
+# Named pipe (FIFO) — multiple writers, agent stays alive
+mkfifo /tmp/agent_in
+python -m stage0 < /tmp/agent_in &
+echo "message 1" > /tmp/agent_in
+echo "message 2" > /tmp/agent_in
+
+# Chain agents — one agent's stdout feeds another's stdin
+stage0_researcher | stage0_coder
 ```
+
+**Key detail**: the agent loops as long as stdin is open. `echo` sends one message then closes the pipe — the agent processes it but then idles. For sustained interaction, use interactive mode, `tail -f`, or a FIFO.
 
 This makes stage0 composable. It's a Unix citizen — it can be piped, backgrounded, chained, and orchestrated.
 
