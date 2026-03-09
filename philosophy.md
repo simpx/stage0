@@ -1,6 +1,6 @@
 # 🌱 physis Philosophy
 
-## 1. Living Agent
+## 1. Living
 
 physis is living. It continuously **perceives**, **cognizes**, and **acts**, driven by its own rhythm.
 

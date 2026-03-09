@@ -1,6 +1,6 @@
 # 🌱 physis 哲学
 
-## 1. Living Agent
+## 1. Living
 
 physis 是活的。它持续地**感知**、**认知**、**行动**，由自身的节奏驱动。
 
