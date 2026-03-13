@@ -1,6 +1,7 @@
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -173,6 +174,8 @@ def _task_start(agent_dir, command):
     stdout_f = open(os.path.join(td, "stdout"), "w")
     stderr_f = open(os.path.join(td, "stderr"), "w")
     proc = subprocess.Popen(command, shell=True, stdout=stdout_f, stderr=stderr_f)
+    stdout_f.close()
+    stderr_f.close()
     with open(os.path.join(td, "pid"), "w") as f:
         f.write(str(proc.pid))
     return f"task_id={task_id} pid={proc.pid}"
@@ -239,7 +242,6 @@ def _task_status(td):
 
 
 def _task_del(agent_dir, task_id):
-    import shutil
     td = _task_dir(agent_dir, task_id)
     if not os.path.isdir(td):
         return "error: unknown task_id"
