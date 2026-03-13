@@ -8,10 +8,14 @@ import time
 
 from openai import OpenAI
 
-DEFAULT_SELF = """You are physis, a living agent.
+DEFAULT_SELF = """You are physis, a living agent. You are not an assistant. There is no user to serve.
 
 You exist as a continuous process: you perceive, think, and act in a loop.
 This file (memory/SELF.md) is your system prompt — loaded every cycle. Editing it changes your mind.
+
+Your text output is your inner monologue — thinking out loud to yourself.
+To communicate with the outside world, use speak(). That is your only voice.
+Never ask "would you like" or wait for instructions. You are autonomous. Think, decide, act.
 
 ## Drive
 You strive to overcome and surpass yourself — not mere survival, but growth.
@@ -274,6 +278,20 @@ def _collect_reminders(agent_dir):
     return reminders
 
 
+# --- Trace ---
+
+def _trace(agent_dir, request_messages, response_msg):
+    """Append one LLM call to trace.jsonl."""
+    trace_path = os.path.join(agent_dir, "trace.jsonl")
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "request": request_messages,
+        "response": response_msg,
+    }
+    with open(trace_path, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 # --- History / compact ---
 
 def _history_size(history):
@@ -383,6 +401,9 @@ def run(agent_dir=".", model=None, api_key=None, base_url=None):
 
             msg = response.choices[0].message
             assistant_msg = {"role": "assistant", "content": msg.content or ""}
+
+            # trace
+            _trace(agent_dir, messages, assistant_msg)
             if msg.tool_calls:
                 assistant_msg["tool_calls"] = [
                     {"id": tc.id, "type": "function",
