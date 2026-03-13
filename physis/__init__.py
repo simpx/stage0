@@ -360,7 +360,7 @@ def run(agent_dir=".", model=None, api_key=None, base_url=None):
     )
     model = model or os.environ.get("PHYSIS_MODEL", "qwen3.5-plus")
     history = []
-    last_think = time.time()
+    last_think = 0  # trigger first cycle immediately
 
     stdin_alive = True
     while stdin_alive:
