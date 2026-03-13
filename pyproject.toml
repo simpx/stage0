@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "physis"
@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A living agent that pulls the world and evolves itself"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["anthropic>=0.40"]
+dependencies = ["openai>=1.0"]
 
 [project.scripts]
 physis = "physis:run"
