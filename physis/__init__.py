@@ -620,18 +620,23 @@ def _setup_logging(agent_dir):
 
 def _thought(session_id, content):
     ts = time.strftime("%H:%M:%S")
-    line = f"[{ts}][{session_id}] {content}\n\n"
+    line = f"[{ts}][{session_id}] {content}\n"
     _thought_file.write(line)
     _thought_file.flush()
-    print(line, end="", file=sys.stderr, flush=True)
+    _sl.log(f"[dim]{ts}[/dim] [cyan]{session_id}[/cyan] {content}")
 
 
 class _StatusLine:
-    """A single-line stderr display showing recent operation timeline."""
+    """Persistent status bar using rich.Live, with log output scrolling above."""
     def __init__(self, max_items=10):
-        self.items = []  # [(label, duration), ...] completed
+        from rich.live import Live
+        from rich.console import Console
+        self.console = Console(stderr=True)
+        self.live = Live(console=self.console, refresh_per_second=4)
+        self.live.start()
+        self.items = []
         self.max_items = max_items
-        self.current = None  # (label, start_time)
+        self.current = None
         self.session_id = ""
 
     def begin(self, session_id, label):
@@ -647,7 +652,11 @@ class _StatusLine:
     def clear(self):
         self._finish_current()
         self.items = []
-        print(f"\r\033[K", end="", file=sys.stderr, flush=True)
+        self._render()
+
+    def log(self, message):
+        """Print above the status line."""
+        self.live.console.print(message, highlight=False)
 
     def _finish_current(self):
         if self.current:
@@ -658,18 +667,17 @@ class _StatusLine:
             self.current = None
 
     def _render(self):
-        parts = []
+        from rich.text import Text
+        line = Text()
+        line.append(f"{self.session_id} ", style="bold blue")
         for label, dur in self.items:
-            parts.append(f"[{label} {dur:.1f}s]")
+            color = "green" if dur < 1 else "yellow" if dur < 5 else "red"
+            line.append(f"[{label} {dur:.1f}s] ", style=color)
         if self.current:
             label, start = self.current
             dur = time.time() - start
-            parts.append(f"[{label} {dur:.1f}s...]")
-        line = f"{self.session_id} " + " ".join(parts)
-        # truncate to terminal width (assume 120)
-        if len(line) > 119:
-            line = line[-119:]
-        print(f"\r\033[K{line}", end="", file=sys.stderr, flush=True)
+            line.append(f"[{label} {dur:.1f}s…] ", style="bold magenta")
+        self.live.update(line)
 
 _sl = _StatusLine()
 
