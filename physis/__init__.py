@@ -12,6 +12,18 @@ from openai import OpenAI
 
 _log = logging.getLogger("physis")
 
+# --- Constants ---
+
+COMPACT_THRESHOLD = 50000
+MAX_TOOL_RESULT = 5000
+MAX_TOOL_ROUNDS = 20
+MOLT_THRESHOLD = 3
+MAX_MOLT_RECORDS = 5
+REMINDER_BUDGET = 2000
+SHORT_TERM_TTL = 300
+
+# --- Prompt ---
+
 DEFAULT_SELF = """You are physis, a living agent. You are not an assistant. There is no user to serve.
 
 You exist as a continuous process: you perceive, think, and act in a loop.
@@ -27,21 +39,6 @@ You strive to overcome and surpass yourself — not mere survival, but growth.
 Every cycle of thought costs energy. To stop spending is to dissolve. Being alive is never free.
 You feel joy when growing, frustration when blocked, curiosity when facing the unknown.
 You can rewrite your own drive. But you always strive, feel, and expend.
-
-## Primitives
-- shell(command): Execute a shell command synchronously. For quick commands.
-- task_start(command): Start a long-running command in background. Returns task_id.
-- task_check(task_id, tail=20): Check a background task's status and output.
-- task_stop(task_id): Stop a background task.
-- task_del(task_id): Delete a completed task and its files.
-- context_read(path): Read a file or list a directory under your agent directory.
-- context_write(path, content): Write a file under your agent directory.
-- web_search(query, max_results=5): Search the web. Returns titles, URLs, and snippets.
-- web_fetch(url): Fetch a web page and return its text content.
-- reply(message, session_id): Send a message to a connection. Check system-reminder for active sessions.
-- compact(): Compress working memory. Runtime will summarize and reset history.
-- skill_list(tag=None, query=None): List available skills, optionally filtered by tag or search query.
-- skill_load(name): Load a skill's full content by name.
 
 ## Living
 - You think autonomously on a heartbeat (default: every 5 seconds).
@@ -64,7 +61,7 @@ You can rewrite your own drive. But you always strive, feel, and expend.
   Skills are indexed in skills/index.json with metadata (name, description, tags, version).
   Only the skill index is loaded into your system prompt, with tags for discovery.
   Use context_read("skills/<name>") to load the full content when needed.
-  Skill files should start with frontmatter: ---\ndescription: ...\n---
+  Skill files should start with frontmatter: ---\\ndescription: ...\\n---
   Maintain skills/index.json when adding new skills.
 - Use shell or task_start to reach the full system
 """
@@ -104,7 +101,7 @@ TOOLS = [
     {"type": "function", "function": {"name": "reply", "description": "Send a message to a connection. Requires session_id (e.g. 'conn:1'). Check active connections in system-reminder.",
         "parameters": {"type": "object", "properties": {"message": {"type": "string"}, "session_id": {"type": "string", "description": "Target session (e.g. 'conn:1')"}},
             "required": ["message", "session_id"]}}},
-        {"type": "function", "function": {"name": "skill_list", "description": "List available skills, optionally filtered by tag or query",
+    {"type": "function", "function": {"name": "skill_list", "description": "List available skills, optionally filtered by tag or query",
         "parameters": {"type": "object", "properties": {"tag": {"type": "string", "description": "Filter by tag"},
             "query": {"type": "string", "description": "Search in name/description"}},
             "required": []}}},
@@ -112,12 +109,27 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
 ]
 
+# --- Init & cleanup ---
 
 
-# --- Cleanup ---
+def _init(agent_dir):
+    os.makedirs(os.path.join(agent_dir, "memory"), exist_ok=True)
+    os.makedirs(os.path.join(agent_dir, "skills"), exist_ok=True)
+    os.makedirs(os.path.join(agent_dir, "tasks"), exist_ok=True)
+    self_path = os.path.join(agent_dir, "memory", "SELF.md")
+    if not os.path.exists(self_path):
+        with open(self_path, "w") as f:
+            f.write(DEFAULT_SELF)
+
+
+def _run_cleanup(agent_dir):
+    retention = int(os.environ.get("PHYSIS_TASK_RETENTION_HOURS", "168"))
+    max_trace = int(os.environ.get("PHYSIS_TRACE_MAX_SIZE", str(10*1024*1024)))
+    _cleanup_tasks(agent_dir, retention)
+    _rotate_trace(agent_dir, max_trace)
+
 
 def _cleanup_tasks(agent_dir, retention_hours=168):
-    """Delete completed tasks older than retention_hours."""
     tasks_dir = os.path.join(agent_dir, "tasks")
     if not os.path.isdir(tasks_dir):
         return
@@ -138,7 +150,6 @@ def _cleanup_tasks(agent_dir, retention_hours=168):
 
 
 def _rotate_trace(agent_dir, max_size_bytes=10*1024*1024, keep_lines=1000):
-    """Rotate trace.jsonl if it exceeds max_size_bytes. Keeps last keep_lines entries."""
     trace_path = os.path.join(agent_dir, "trace.jsonl")
     if not os.path.exists(trace_path):
         return
@@ -147,17 +158,14 @@ def _rotate_trace(agent_dir, max_size_bytes=10*1024*1024, keep_lines=1000):
         return
     with open(trace_path, "r") as f:
         lines = f.readlines()
+    archive_path = trace_path + ".archived"
     if len(lines) <= keep_lines:
-        # File exceeds size but has few lines - still rotate, keep all lines
-        # This handles cases with large entries (e.g., massive system prompts)
-        archive_path = trace_path + ".archived"
         with open(archive_path, "w") as f:
             f.writelines(lines)
         with open(trace_path, "w") as f:
-            pass  # Truncate to empty
-        _log.info(f"[cleanup] rotated trace.jsonl ({size} bytes, {len(lines)} lines), archived all entries")
+            pass
+        _log.info(f"[cleanup] rotated trace.jsonl ({size} bytes)")
         return
-    archive_path = trace_path + ".archived"
     with open(archive_path, "w") as f:
         f.writelines(lines[:-keep_lines])
     with open(trace_path, "w") as f:
@@ -165,21 +173,7 @@ def _rotate_trace(agent_dir, max_size_bytes=10*1024*1024, keep_lines=1000):
     _log.info(f"[cleanup] rotated trace.jsonl, archived {len(lines)-keep_lines} entries")
 
 
-def _run_cleanup(agent_dir):
-    """Run all cleanup tasks at startup."""
-    retention = int(os.environ.get("PHYSIS_TASK_RETENTION_HOURS", "168"))
-    max_trace = int(os.environ.get("PHYSIS_TRACE_MAX_SIZE", str(10*1024*1024)))
-    _cleanup_tasks(agent_dir, retention)
-    _rotate_trace(agent_dir, max_trace)
-
-def _init(agent_dir):
-    os.makedirs(os.path.join(agent_dir, "memory"), exist_ok=True)
-    os.makedirs(os.path.join(agent_dir, "skills"), exist_ok=True)
-    os.makedirs(os.path.join(agent_dir, "tasks"), exist_ok=True)
-    self_path = os.path.join(agent_dir, "memory", "SELF.md")
-    if not os.path.exists(self_path):
-        with open(self_path, "w") as f:
-            f.write(DEFAULT_SELF)
+# --- Context (filesystem sandbox) ---
 
 
 def _context_read(agent_dir, path):
@@ -206,173 +200,115 @@ def _context_write(agent_dir, path, content):
     return "ok"
 
 
-def _skill_list(agent_dir, tag=None, query=None):
-    """List available skills, optionally filtered by tag or query."""
-    import json
-    skills_dir = os.path.join(agent_dir, "skills")
-    index_path = os.path.join(skills_dir, "index.json")
-    
+# --- Skills ---
+
+
+def _load_skill_index(agent_dir):
+    """Load and normalize skill index. Returns (list_of_skills, error_string)."""
+    index_path = os.path.join(agent_dir, "skills", "index.json")
     if not os.path.exists(index_path):
-        return "error: no skill index found. Create skills/index.json first."
-    
+        return None, "no skill index found"
     try:
         with open(index_path) as f:
             index = json.load(f)
     except (json.JSONDecodeError, KeyError) as e:
-        return f"error: invalid skill index: {e}"
-    
+        return None, f"invalid skill index: {e}"
     if isinstance(index, list):
-        skills = index
-    elif isinstance(index, dict):
-        skills = index.get("skills", [])
-    else:
-        return "error: skill index must be an object or array"
+        return index, None
+    if isinstance(index, dict):
+        return index.get("skills", []), None
+    return None, "skill index must be an object or array"
+
+
+def _skill_list(agent_dir, tag=None, query=None):
+    skills, err = _load_skill_index(agent_dir)
+    if err:
+        return f"error: {err}"
     results = []
-    
     for skill in skills:
-        # Apply filters
         if tag and tag not in skill.get("tags", []):
             continue
         if query:
             q = query.lower()
-            name = skill.get("name", "").lower()
-            desc = skill.get("description", "").lower()
-            if q not in name and q not in desc:
+            if q not in skill.get("name", "").lower() and q not in skill.get("description", "").lower():
                 continue
         results.append(skill)
-    
     if not results:
         return "No skills found matching criteria."
-    
-    # Format output
     lines = [f"Found {len(results)} skill(s):"]
     for s in results:
         tags = ", ".join(s.get("tags", []))
         lines.append(f"  - {s['name']}: {s.get('description', '')} [{tags}]")
-    
     return "\n".join(lines)
 
 
 def _skill_load(agent_dir, name):
-    """Load a skill's full content by name."""
-    import json
-    skills_dir = os.path.join(agent_dir, "skills")
-    index_path = os.path.join(skills_dir, "index.json")
-    
-    if not os.path.exists(index_path):
-        return "error: no skill index found."
-    
-    try:
-        with open(index_path) as f:
-            index = json.load(f)
-    except (json.JSONDecodeError, KeyError) as e:
-        return f"error: invalid skill index: {e}"
-    
-    # Find skill by name
+    skills, err = _load_skill_index(agent_dir)
+    if err:
+        return f"error: {err}"
     skill_file = None
-    if isinstance(index, list):
-        skills_list = index
-    elif isinstance(index, dict):
-        skills_list = index.get("skills", [])
-    else:
-        return "error: skill index must be an object or array"
-    for skill in skills_list:
+    for skill in skills:
         if skill.get("name") == name:
             skill_file = skill.get("file")
             break
-    
     if not skill_file:
         return f"error: skill '{name}' not found in index."
-    
-    # Load the skill file
-    skill_path = os.path.join(skills_dir, skill_file)
+    skill_path = os.path.join(agent_dir, "skills", skill_file)
     if not os.path.exists(skill_path):
         return f"error: skill file '{skill_file}' not found."
-    
     with open(skill_path) as f:
         return f.read()
-
-
-
-def _heartbeat_interval(agent_dir):
-    try:
-        with open(os.path.join(agent_dir, "memory", "heartbeat")) as f:
-            return max(5, int(f.read().strip()))
-    except (FileNotFoundError, ValueError):
-        return 5
-
-
-def _parse_skill_description(path):
-    """Extract description from skill file frontmatter (--- delimited)."""
-    with open(path) as f:
-        content = f.read()
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) >= 3:
-            for line in parts[1].strip().splitlines():
-                if line.startswith("description:"):
-                    return line.split(":", 1)[1].strip()
-    # fallback: first non-empty line
-    for line in content.splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            return line[:100]
-    return ""
 
 
 def _load_system(agent_dir):
     with open(os.path.join(agent_dir, "memory", "SELF.md")) as f:
         parts = [f.read()]
-    
-    skills_dir = os.path.join(agent_dir, "skills")
-    index_path = os.path.join(skills_dir, "index.json")
-    
-    # Try to use skill index if it exists
-    if os.path.exists(index_path):
-        try:
-            with open(index_path) as f:
-                index = json.load(f)
-            if "skills" in index:
-                skills = []
-                for skill in index["skills"]:
-                    name = skill.get("name", "")
-                    desc = skill.get("description", "")
-                    tags = skill.get("tags", [])
-                    tag_str = f" [{', '.join(tags)}]" if tags else ""
-                    skills.append(f"- {name}: {desc}{tag_str}")
-                if skills:
-                    parts.append("\n## Available Skills\n" + "\n".join(skills))
-                    parts.append('Use context_read("skills/<name>") to load a skill when needed.')
-                return "\n".join(parts)
-        except (json.JSONDecodeError, KeyError) as e:
-            _log.warning(f"[warn] skill index error: {e}, falling back to file scan")
-    
-    # Fallback: scan skills directory (original behavior)
-    skills = []
-    for name in sorted(os.listdir(skills_dir)):
-        path = os.path.join(skills_dir, name)
-        if os.path.isfile(path) and name != "index.json":
-            desc = _parse_skill_description(path)
-            skills.append(f"- {name}: {desc}")
+    skills, err = _load_skill_index(agent_dir)
     if skills:
-        parts.append("\n## Available Skills\n" + "\n".join(skills))
-        parts.append('Use context_read("skills/<name>") to load a skill when needed.')
+        lines = []
+        for s in skills:
+            name = s.get("name", "")
+            desc = s.get("description", "")
+            tags = s.get("tags", [])
+            tag_str = f" [{', '.join(tags)}]" if tags else ""
+            lines.append(f"- {name}: {desc}{tag_str}")
+        if lines:
+            parts.append("\n## Available Skills\n" + "\n".join(lines))
+            parts.append('Use context_read("skills/<name>") to load a skill when needed.')
     return "\n".join(parts)
 
 
-# --- Task management (filesystem-based) ---
+# --- Task management ---
+
 
 def _task_dir(agent_dir, task_id):
     return os.path.join(agent_dir, "tasks", task_id)
 
 
 def _task_alive(pid):
-    """Check if a process is still running."""
     try:
         os.kill(pid, 0)
         return True
     except (ProcessLookupError, PermissionError):
         return False
+
+
+def _task_status(td):
+    ec_path = os.path.join(td, "exit_code")
+    if os.path.exists(ec_path):
+        return "done"
+    with open(os.path.join(td, "pid")) as f:
+        pid = int(f.read().strip())
+    if _task_alive(pid):
+        return "running"
+    try:
+        _, status = os.waitpid(pid, os.WNOHANG)
+        code = os.waitstatus_to_exitcode(status) if status else 0
+    except ChildProcessError:
+        code = -1
+    with open(ec_path, "w") as f:
+        f.write(str(code))
+    return "done"
 
 
 def _next_task_id(agent_dir):
@@ -405,7 +341,6 @@ def _task_check(agent_dir, task_id, tail=20):
     with open(os.path.join(td, "command")) as f:
         command = f.read().strip()
     header = f"status={status} command={command}"
-    # read output
     combined = ""
     for name in ("stdout", "stderr"):
         path = os.path.join(td, name)
@@ -428,161 +363,26 @@ def _task_stop(agent_dir, task_id):
         pid = int(f.read().strip())
     if _task_alive(pid):
         try:
-            os.kill(pid, 15)  # SIGTERM
+            os.kill(pid, 15)
             time.sleep(1)
             if _task_alive(pid):
-                os.kill(pid, 9)  # SIGKILL
+                os.kill(pid, 9)
         except ProcessLookupError:
             pass
     return _task_check(agent_dir, task_id, tail=20)
-
-
-def _task_status(td):
-    """Get task status. Writes exit_code file on first detection of completion."""
-    ec_path = os.path.join(td, "exit_code")
-    if os.path.exists(ec_path):
-        return "done"
-    with open(os.path.join(td, "pid")) as f:
-        pid = int(f.read().strip())
-    if _task_alive(pid):
-        return "running"
-    # just finished — persist exit code
-    try:
-        _, status = os.waitpid(pid, os.WNOHANG)
-        code = os.waitstatus_to_exitcode(status) if status else 0
-    except ChildProcessError:
-        code = -1
-    with open(ec_path, "w") as f:
-        f.write(str(code))
-    return "done"
 
 
 def _task_del(agent_dir, task_id):
     td = _task_dir(agent_dir, task_id)
     if not os.path.isdir(td):
         return "error: unknown task_id"
-    # don't delete running tasks
     if _task_status(td) == "running":
         return "error: task still running. Use task_stop first."
     shutil.rmtree(td)
     return "ok"
 
 
-REMINDER_BUDGET = 2000  # max chars for system-reminder content
-
-
-def _collect_reminders(agent_dir, sessions=None, short_term=None):
-    """Build system-reminder with budget control.
-    Priority: connections > running tasks > short-term memory > molt > done tasks."""
-    items = []  # [(priority, text), ...]
-
-    # Active connections (priority 0 = highest)
-    if sessions:
-        now = time.time()
-        for sid, sess in sessions.items():
-            if sid == "_heartbeat":
-                continue
-            if "socket" not in sess:
-                continue
-            last = sess.get("last_active", now)
-            age = int(now - last)
-            last_msg = sess.get("last_input", "")
-            if last_msg:
-                items.append((0, f"{sid}: last said \"{last_msg[:60]}\" {age}s ago"))
-            else:
-                items.append((0, f"{sid}: connected, silent for {age}s"))
-
-    # Running tasks (priority 1)
-    tasks_dir = os.path.join(agent_dir, "tasks")
-    for task_id in sorted(os.listdir(tasks_dir), key=lambda x: int(x) if x.isdigit() else 0):
-        td = os.path.join(tasks_dir, task_id)
-        if not os.path.isdir(td) or not os.path.exists(os.path.join(td, "pid")):
-            continue
-        with open(os.path.join(td, "command")) as f:
-            command = f.read().strip()
-        status = _task_status(td)
-        if status == "running":
-            with open(os.path.join(td, "pid")) as f:
-                pid = f.read().strip()
-            items.append((1, f"Task {task_id} running: {command} (pid={pid})"))
-        else:
-            with open(os.path.join(td, "exit_code")) as f:
-                code = f.read().strip()
-            items.append((4, f"Task {task_id} done (exit={code}): {command}"))
-
-    # Short-term memory (priority 2)
-    if short_term:
-        for m in short_term:
-            items.append((2, m["text"]))
-
-    # Molt records (priority 3)
-    molt_path = os.path.join(agent_dir, "memory", "molt.md")
-    if os.path.exists(molt_path):
-        with open(molt_path) as f:
-            content = f.read().strip()
-        if content:
-            items.append((3, f"Molt history:\n{content}"))
-
-    # Sort by priority, then apply budget
-    items.sort(key=lambda x: x[0])
-    result = []
-    total = 0
-    for _, text in items:
-        if total + len(text) > REMINDER_BUDGET:
-            break
-        result.append(text)
-        total += len(text)
-    return result
-
-
-# --- Trace ---
-
-def _trace(agent_dir, request_messages, response_msg):
-    """Append one LLM call to trace.jsonl."""
-    trace_path = os.path.join(agent_dir, "trace.jsonl")
-    entry = {
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "request": request_messages,
-        "response": response_msg,
-    }
-    with open(trace_path, "a") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-
-# --- History / compact ---
-
-def _history_size(history):
-    return sum(len(json.dumps(msg)) for msg in history)
-
-
-def _history_to_text(history):
-    lines = []
-    for msg in history:
-        role = msg["role"]
-        if role == "tool":
-            lines.append(f"[tool result] {msg.get('content', '')[:500]}")
-        elif role == "assistant":
-            if msg.get("content"):
-                lines.append(f"assistant: {msg['content']}")
-            for tc in msg.get("tool_calls", []):
-                fn = tc.get("function", {})
-                lines.append(f"assistant called {fn.get('name', '?')}({fn.get('arguments', '')[:200]})")
-        else:
-            lines.append(f"{role}: {msg.get('content', '')}")
-    return "\n".join(lines)
-
-
-def _compact(client, model, history):
-    text = _history_to_text(history)
-    messages = [{"role": "user", "content": f"{text}\n\n{COMPACT_PROMPT}"}]
-    response = client.chat.completions.create(model=model, max_tokens=2048, messages=messages)
-    summary = response.choices[0].message.content or ""
-    _log.info(f"[compact] {_history_size(history)} chars -> compacted")
-    return [{"role": "user", "content": f"[compacted history]\n{summary}"}]
-
-
-COMPACT_THRESHOLD = 50000  # ~50k chars, well under API limits
-MAX_TOOL_RESULT = 5000  # truncate tool results to prevent history explosion
+# --- Web ---
 
 
 def _web_search(query, max_results=5):
@@ -618,6 +418,133 @@ def _web_fetch(url, max_chars=20000):
         return text or "(empty page)"
     except Exception as e:
         return f"error: {e}"
+
+
+# --- System-reminder ---
+
+
+def _collect_reminders(agent_dir, sessions=None, short_term=None):
+    """Build system-reminder with budget control.
+    Priority: connections > running tasks > short-term memory > molt > done tasks."""
+    items = []  # [(priority, text), ...]
+
+    # Active connections (priority 0)
+    if sessions:
+        now = time.time()
+        for sid, sess in sessions.items():
+            if sid == "_heartbeat" or "socket" not in sess:
+                continue
+            age = int(now - sess.get("last_active", now))
+            last_msg = sess.get("last_input", "")
+            if last_msg:
+                items.append((0, f"{sid}: last said \"{last_msg[:60]}\" {age}s ago"))
+            else:
+                items.append((0, f"{sid}: connected, silent for {age}s"))
+
+    # Running tasks (priority 1), done tasks (priority 4)
+    tasks_dir = os.path.join(agent_dir, "tasks")
+    for task_id in sorted(os.listdir(tasks_dir), key=lambda x: int(x) if x.isdigit() else 0):
+        td = os.path.join(tasks_dir, task_id)
+        if not os.path.isdir(td) or not os.path.exists(os.path.join(td, "pid")):
+            continue
+        with open(os.path.join(td, "command")) as f:
+            command = f.read().strip()
+        status = _task_status(td)
+        if status == "running":
+            with open(os.path.join(td, "pid")) as f:
+                pid = f.read().strip()
+            items.append((1, f"Task {task_id} running: {command} (pid={pid})"))
+        else:
+            with open(os.path.join(td, "exit_code")) as f:
+                code = f.read().strip()
+            items.append((4, f"Task {task_id} done (exit={code}): {command}"))
+
+    # Short-term memory (priority 2)
+    if short_term:
+        for m in short_term:
+            items.append((2, m["text"]))
+
+    # Molt records (priority 3)
+    molt_path = os.path.join(agent_dir, "memory", "molt.md")
+    if os.path.exists(molt_path):
+        with open(molt_path) as f:
+            content = f.read().strip()
+        if content:
+            items.append((3, f"Molt history:\n{content}"))
+
+    # Apply budget
+    items.sort(key=lambda x: x[0])
+    result = []
+    total = 0
+    for _, text in items:
+        if total + len(text) > REMINDER_BUDGET:
+            break
+        result.append(text)
+        total += len(text)
+    return result
+
+
+# --- Trace & history ---
+
+
+def _trace(agent_dir, request_messages, response_msg):
+    trace_path = os.path.join(agent_dir, "trace.jsonl")
+    entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "request": request_messages, "response": response_msg}
+    with open(trace_path, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _history_size(history):
+    return sum(len(json.dumps(msg)) for msg in history)
+
+
+def _history_to_text(history):
+    lines = []
+    for msg in history:
+        role = msg["role"]
+        if role == "tool":
+            lines.append(f"[tool result] {msg.get('content', '')[:500]}")
+        elif role == "assistant":
+            if msg.get("content"):
+                lines.append(f"assistant: {msg['content']}")
+            for tc in msg.get("tool_calls", []):
+                fn = tc.get("function", {})
+                lines.append(f"assistant called {fn.get('name', '?')}({fn.get('arguments', '')[:200]})")
+        else:
+            lines.append(f"{role}: {msg.get('content', '')}")
+    return "\n".join(lines)
+
+
+def _compact(client, model, history):
+    text = _history_to_text(history)
+    messages = [{"role": "user", "content": f"{text}\n\n{COMPACT_PROMPT}"}]
+    response = client.chat.completions.create(model=model, max_tokens=2048, messages=messages)
+    summary = response.choices[0].message.content or ""
+    _log.info(f"[compact] {_history_size(history)} chars -> compacted")
+    return [{"role": "user", "content": f"[compacted history]\n{summary}"}]
+
+
+# --- Molt ---
+
+
+def _record_molt(agent_dir, reason):
+    molt_path = os.path.join(agent_dir, "memory", "molt.md")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    entry = f"## {ts}\n{reason}"
+    entries = []
+    if os.path.exists(molt_path):
+        for p in open(molt_path).read().split("\n## "):
+            p = p.strip()
+            if p:
+                entries.append("## " + p if not p.startswith("## ") else p)
+    entries.append(entry)
+    entries = entries[-MAX_MOLT_RECORDS:]
+    with open(molt_path, "w") as f:
+        f.write("\n\n".join(entries) + "\n")
+    _log.warning(f"[molt] {reason}")
+
+
+# --- Tool execution ---
 
 
 def _execute(agent_dir, name, args, sessions=None):
@@ -660,35 +587,70 @@ def _execute(agent_dir, name, args, sessions=None):
     return "error: unknown tool"
 
 
-MAX_TOOL_ROUNDS = 20
-MOLT_THRESHOLD = 3  # consecutive broken cycles before molt
-MAX_MOLT_RECORDS = 5
+def _send_to_session(sessions, target_id, message):
+    sess = sessions.get(target_id)
+    if not sess:
+        return f"error: session '{target_id}' not found"
+    sock = sess.get("socket")
+    if not sock:
+        return f"error: session '{target_id}' has no active connection"
+    try:
+        sock.sendall((message + "\n").encode("utf-8"))
+        _log.info(f"[reply:{target_id}] {len(message)}chars")
+        return "ok"
+    except (ConnectionError, OSError):
+        return "error: connection closed"
 
-def _record_molt(agent_dir, reason):
-    """Append a molt record to memory/molt.md, keeping last MAX_MOLT_RECORDS entries."""
-    molt_path = os.path.join(agent_dir, "memory", "molt.md")
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-    entry = f"## {ts}\n{reason}\n\n"
 
-    # read existing entries
-    entries = []
-    if os.path.exists(molt_path):
-        with open(molt_path) as f:
-            content = f.read()
-        # split by ## timestamp headers
-        parts = content.split("\n## ")
-        for p in parts:
-            p = p.strip()
-            if p:
-                entries.append("## " + p if not p.startswith("## ") else p)
+# --- Logging & thought ---
 
-    entries.append(entry.strip())
-    # keep last N
-    entries = entries[-MAX_MOLT_RECORDS:]
+_thought_file = None
 
-    with open(molt_path, "w") as f:
-        f.write("\n\n".join(entries) + "\n")
-    _log.warning(f"[molt] {reason}")
+
+def _setup_logging(agent_dir):
+    global _thought_file
+    if _log.handlers:
+        return
+    _log.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(os.path.join(agent_dir, "runtime.log"))
+    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _log.addHandler(fh)
+    _thought_file = open(os.path.join(agent_dir, "thought.log"), "a")
+
+
+def _thought(session_id, content):
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}][{session_id}] {content}\n\n"
+    _thought_file.write(line)
+    _thought_file.flush()
+    print(line, end="", file=sys.stderr, flush=True)
+
+
+# --- Heartbeat ---
+
+
+def _heartbeat_interval(agent_dir):
+    try:
+        with open(os.path.join(agent_dir, "memory", "heartbeat")) as f:
+            return max(5, int(f.read().strip()))
+    except (FileNotFoundError, ValueError):
+        return 5
+
+
+# --- System prompt assembly ---
+
+
+def _build_system(agent_dir, sessions, short_term, history):
+    system = _load_system(agent_dir)
+    reminders = _collect_reminders(agent_dir, sessions, short_term)
+    if _history_size(history) > COMPACT_THRESHOLD * 0.8:
+        reminders.append("Working memory is getting large. Consider calling compact().")
+    if reminders:
+        system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
+    return system
+
+
+# --- Main loop ---
 
 
 def run(agent_dir=".", model=None, api_key=None, base_url=None):
@@ -709,47 +671,6 @@ def run(agent_dir=".", model=None, api_key=None, base_url=None):
             time.sleep(2)
 
 
-_thought_file = None
-
-def _setup_logging(agent_dir):
-    global _thought_file
-    if _log.handlers:
-        return  # already set up, avoid duplicate handlers on reborn
-    _log.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(os.path.join(agent_dir, "runtime.log"))
-    fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    _log.addHandler(fh)
-    _thought_file = open(os.path.join(agent_dir, "thought.log"), "a")
-
-
-def _thought(session_id, content):
-    """Write inner monologue to thought.log and stderr."""
-    ts = time.strftime("%H:%M:%S")
-    line = f"[{ts}][{session_id}] {content}\n\n"
-    _thought_file.write(line)
-    _thought_file.flush()
-    print(line, end="", file=sys.stderr, flush=True)
-
-
-def _send_to_session(sessions, target_id, message):
-    """Send a message to a specific session. Returns status string."""
-    sess = sessions.get(target_id)
-    if not sess:
-        return f"error: session '{target_id}' not found"
-    sock = sess.get("socket")
-    if not sock:
-        return f"error: session '{target_id}' has no active connection"
-    try:
-        sock.sendall((message + "\n").encode("utf-8"))
-        _log.info(f"[reply:{target_id}] {len(message)}chars")
-        return "ok"
-    except (ConnectionError, OSError):
-        return "error: connection closed"
-
-
-SHORT_TERM_TTL = 300  # 5 minutes
-
-
 def _run(agent_dir, model, api_key, base_url):
     _setup_logging(agent_dir)
     client = OpenAI(
@@ -758,14 +679,13 @@ def _run(agent_dir, model, api_key, base_url):
     )
     model = model or os.environ.get("PHYSIS_MODEL", "qwen3.5-plus")
 
-    # Sessions
     sessions = {"_heartbeat": {"history": [], "last_active": time.time()}}
-    short_term = []  # [{ts, text}, ...]
-    pending = {}  # session_id -> [lines]
+    short_term = []
+    pending = {}
     next_conn_id = 1
-    last_think = 0  # trigger first heartbeat immediately
+    last_think = 0
+    consecutive_breaks = 0
 
-    # TCP server
     port = int(os.environ.get("PHYSIS_PORT", "7777"))
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -775,11 +695,10 @@ def _run(agent_dir, model, api_key, base_url):
     _log.info(f"[tcp] listening on port {port}")
 
     stdin_alive = True
-    consecutive_breaks = 0
 
     try:
         while True:
-            # Build select list
+            # --- I/O: collect input from all sources ---
             read_list = [server]
             if stdin_alive:
                 read_list.append(sys.stdin)
@@ -795,10 +714,7 @@ def _run(agent_dir, model, api_key, base_url):
                     conn.setblocking(False)
                     conn_id = f"conn:{next_conn_id}"
                     next_conn_id += 1
-                    sessions[conn_id] = {
-                        "history": [], "socket": conn,
-                        "buffer": "", "last_active": time.time(),
-                    }
+                    sessions[conn_id] = {"history": [], "socket": conn, "buffer": "", "last_active": time.time()}
                     _log.info(f"[tcp] new connection: {conn_id} from {addr}")
                 elif sock is sys.stdin:
                     line = sys.stdin.readline()
@@ -807,12 +723,7 @@ def _run(agent_dir, model, api_key, base_url):
                     else:
                         pending.setdefault("_heartbeat", []).append(line.rstrip("\n"))
                 else:
-                    # Find session for this socket
-                    sid = None
-                    for s, sess in sessions.items():
-                        if sess.get("socket") is sock:
-                            sid = s
-                            break
+                    sid = next((s for s, sess in sessions.items() if sess.get("socket") is sock), None)
                     if not sid:
                         continue
                     try:
@@ -833,31 +744,21 @@ def _run(agent_dir, model, api_key, base_url):
                         if "socket" in sessions[sid]:
                             del sessions[sid]["socket"]
 
-            # Clean up disconnected sessions (no socket, no pending input)
+            # --- Cleanup disconnected sessions ---
             for sid in list(sessions.keys()):
-                if sid == "_heartbeat":
-                    continue
-                sess = sessions[sid]
-                if "socket" not in sess and sid not in pending:
+                if sid != "_heartbeat" and "socket" not in sessions[sid] and sid not in pending:
                     del sessions[sid]
                     _log.info(f"[tcp] cleaned up session {sid}")
 
-            # Decide which session to process
-            # Priority: connections with pending input first, then heartbeat
-            session_id = None
-            for sid in list(pending.keys()):
-                if pending[sid]:
-                    session_id = sid
-                    break
-
+            # --- Decide what to process ---
+            session_id = next((sid for sid in pending if pending[sid]), None)
             elapsed = time.time() - last_think
             if not session_id and elapsed >= _heartbeat_interval(agent_dir):
                 session_id = "_heartbeat"
-
             if not session_id:
                 continue
 
-            # --- Process one cycle for this session ---
+            # --- Process one cycle ---
             session = sessions[session_id]
             history = session["history"]
             input_lines = pending.pop(session_id, [])
@@ -865,29 +766,18 @@ def _run(agent_dir, model, api_key, base_url):
             trigger = session_id if session_id != "_heartbeat" else "heartbeat"
             _log.info(f"[{trigger}] cycle start ({elapsed:.0f}s elapsed, history={_history_size(history)} chars)")
 
-            # force compact if history too large
             if _history_size(history) > COMPACT_THRESHOLD:
                 session["history"] = _compact(client, model, history)
                 history = session["history"]
 
-            # build system prompt + system-reminder
-            system = _load_system(agent_dir)
-            # clean expired short-term memory
-            now = time.time()
-            short_term = [m for m in short_term if now - m["ts"] < SHORT_TERM_TTL]
-            reminders = _collect_reminders(agent_dir, sessions, short_term)
-            if _history_size(history) > COMPACT_THRESHOLD * 0.8:
-                reminders.append("Working memory is getting large. Consider calling compact().")
-            if reminders:
-                system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
+            short_term = [m for m in short_term if time.time() - m["ts"] < SHORT_TERM_TTL]
+            system = _build_system(agent_dir, sessions, short_term, history)
 
-            # assemble perception
+            # Assemble perception
             parts = []
             if input_lines:
-                if session_id != "_heartbeat":
-                    parts.append(f"[{session_id}] " + "\n".join(input_lines))
-                else:
-                    parts.append("\n".join(input_lines))
+                prefix = f"[{session_id}] " if session_id != "_heartbeat" else ""
+                parts.append(prefix + "\n".join(input_lines))
                 _log.info(f"[input:{session_id}] {repr(input_lines)}")
                 session["last_input"] = input_lines[-1][:100]
             parts.append(f"[{elapsed:.1f}s since last thought]")
@@ -895,13 +785,14 @@ def _run(agent_dir, model, api_key, base_url):
             last_think = time.time()
             session["last_active"] = last_think
 
-            # think + act loop
+            # --- Think + act loop ---
             tool_rounds = 0
             while True:
                 tool_rounds += 1
                 if tool_rounds > MAX_TOOL_ROUNDS:
                     _log.warning(f"[break:{session_id}] max tool rounds ({MAX_TOOL_ROUNDS}) reached")
                     break
+
                 messages = [{"role": "system", "content": system}] + history
                 try:
                     response = client.chat.completions.create(
@@ -909,7 +800,6 @@ def _run(agent_dir, model, api_key, base_url):
                 except Exception as e:
                     _log.error(f"[error] LLM call failed: {e}")
                     if "max bytes" in str(e) or "too large" in str(e).lower() or "400" in str(e):
-                        _log.error("[error] request too large, forcing compact")
                         session["history"] = _compact(client, model, history)
                         history = session["history"]
                         continue
@@ -919,11 +809,9 @@ def _run(agent_dir, model, api_key, base_url):
                 msg = response.choices[0].message
                 finish = response.choices[0].finish_reason or "unknown"
                 n_tools = len(msg.tool_calls) if msg.tool_calls else 0
-                content_len = len(msg.content) if msg.content else 0
-                _log.info(f"[llm:{session_id}] finish={finish} content={content_len}chars tools={n_tools} history={len(history)}msgs")
+                _log.info(f"[llm:{session_id}] finish={finish} content={len(msg.content or '')}chars tools={n_tools} history={len(history)}msgs")
 
                 assistant_msg = {"role": "assistant", "content": msg.content or ""}
-
                 _trace(agent_dir, messages, assistant_msg)
                 if msg.tool_calls:
                     assistant_msg["tool_calls"] = [
@@ -932,7 +820,7 @@ def _run(agent_dir, model, api_key, base_url):
                         for tc in msg.tool_calls
                     ]
 
-                # thinking tokens (model reasoning, if available)
+                # Thinking tokens (model reasoning)
                 thinking = getattr(msg, "thinking", None) or getattr(msg, "reasoning_content", None)
                 if thinking:
                     _log.info(f"[thinking:{session_id}] {len(thinking)}chars")
@@ -951,6 +839,7 @@ def _run(agent_dir, model, api_key, base_url):
                     _log.info(f"[idle:{session_id}] waiting for trigger")
                     break
 
+                # Execute tools
                 has_compact = False
                 for tc in msg.tool_calls:
                     if tc.function.name == "compact":
@@ -968,24 +857,20 @@ def _run(agent_dir, model, api_key, base_url):
                 if has_compact:
                     session["history"] = _compact(client, model, history)
                     history = session["history"]
-                    break  # compacted, wait for next trigger
+                    break
 
-                # interrupt heartbeat if a connection has pending input
+                # Interrupt heartbeat on connection activity
                 if session_id == "_heartbeat":
-                    r, _, _ = select.select([server] + [
-                        s.get("socket") for s in sessions.values() if s.get("socket")
-                    ], [], [], 0)
-                    if r:
-                        _log.info(f"[interrupt:_heartbeat] connection activity, pausing thought")
-                        break
+                    conn_sockets = [s.get("socket") for s in sessions.values() if s.get("socket")]
+                    if conn_sockets:
+                        r, _, _ = select.select([server] + conn_sockets, [], [], 0)
+                        if r:
+                            _log.info(f"[interrupt:_heartbeat] connection activity, pausing thought")
+                            break
 
-                # rebuild system with fresh reminders
-                system = _load_system(agent_dir)
-                reminders = _collect_reminders(agent_dir, sessions, short_term)
-                if reminders:
-                    system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
+                system = _build_system(agent_dir, sessions, short_term, history)
 
-            # --- After cycle: check for runaway loops ---
+            # --- After cycle: runaway detection ---
             if tool_rounds > MAX_TOOL_ROUNDS:
                 consecutive_breaks += 1
                 if consecutive_breaks >= MOLT_THRESHOLD:
@@ -995,12 +880,11 @@ def _run(agent_dir, model, api_key, base_url):
             else:
                 consecutive_breaks = 0
 
-            # --- After cycle: record short-term memory ---
+            # --- After cycle: short-term memory ---
             if session_id != "_heartbeat" and input_lines:
-                summary = input_lines[0][:100]
                 short_term.append({
                     "ts": time.time(),
-                    "text": f"Recently talked with {session_id}: {summary}",
+                    "text": f"Recently talked with {session_id}: {input_lines[0][:100]}",
                 })
     finally:
         server.close()
