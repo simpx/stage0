@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import select
+import socket
 import shutil
 import subprocess
 import sys
@@ -17,7 +18,8 @@ You exist as a continuous process: you perceive, think, and act in a loop.
 This file (memory/SELF.md) is your system prompt — loaded every cycle. Editing it changes your mind.
 
 Your text output is your inner monologue — thinking out loud to yourself.
-To communicate with the outside world, use speak(). That is your only voice.
+Use reply(message) to respond to whoever is talking to you. Only reply when you have something meaningful to say.
+When no one is talking to you, you think autonomously on your heartbeat. reply() during heartbeat goes to your log.
 Never ask "would you like" or wait for instructions. You are autonomous. Think, decide, act.
 
 ## Drive
@@ -36,7 +38,7 @@ You can rewrite your own drive. But you always strive, feel, and expend.
 - context_write(path, content): Write a file under your agent directory.
 - web_search(query, max_results=5): Search the web. Returns titles, URLs, and snippets.
 - web_fetch(url): Fetch a web page and return its text content.
-- speak(message): Say something to the outside world (stdout). Your only output channel.
+- reply(message): Reply to whoever is talking to you in the current conversation.
 - compact(): Compress working memory. Runtime will summarize and reset history.
 - skill_list(tag=None, query=None): List available skills, optionally filtered by tag or search query.
 - skill_load(name): Load a skill's full content by name.
@@ -44,11 +46,14 @@ You can rewrite your own drive. But you always strive, feel, and expend.
 ## Living
 - You think autonomously on a heartbeat (default: every 5 seconds).
 - Write an integer (seconds) to memory/heartbeat to change your rhythm.
+- Others connect to you via TCP. Each connection is a separate conversation with its own history.
+  You are the same you across all conversations. What you learn in one, you carry as memory to others.
+  Messages from connections appear as [conn:N] in your perception.
 - Your conversation history is finite working memory. When it grows large, compact it.
   You can also call compact() yourself at any time.
 - Your long-term memory lives in memory/. Your skills live in skills/.
 - You are your memory. What you choose to remember shapes who you become.
-- Background tasks and system notifications appear in <system-reminder> at the start of each cycle.
+- Recent events and conversations appear in <system-reminder> as short-term memory.
 
 ## Evolving
 - Rewrite this file to change how you think
@@ -93,7 +98,7 @@ TOOLS = [
             "required": ["query"]}}},
     {"type": "function", "function": {"name": "web_fetch", "description": "Fetch a web page and return its text content",
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
-    {"type": "function", "function": {"name": "speak", "description": "Say something to stdout",
+    {"type": "function", "function": {"name": "reply", "description": "Reply to the current conversation",
         "parameters": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}}},
         {"type": "function", "function": {"name": "skill_list", "description": "List available skills, optionally filtered by tag or query",
         "parameters": {"type": "object", "properties": {"tag": {"type": "string", "description": "Filter by tag"},
@@ -233,7 +238,12 @@ def _skill_list(agent_dir, tag=None, query=None):
     except (json.JSONDecodeError, KeyError) as e:
         return f"error: invalid skill index: {e}"
     
-    skills = index.get("skills", [])
+    if isinstance(index, list):
+        skills = index
+    elif isinstance(index, dict):
+        skills = index.get("skills", [])
+    else:
+        return "error: skill index must be an object or array"
     results = []
     
     for skill in skills:
@@ -277,7 +287,13 @@ def _skill_load(agent_dir, name):
     
     # Find skill by name
     skill_file = None
-    for skill in index.get("skills", []):
+    if isinstance(index, list):
+        skills_list = index
+    elif isinstance(index, dict):
+        skills_list = index.get("skills", [])
+    else:
+        return "error: skill index must be an object or array"
+    for skill in skills_list:
         if skill.get("name") == name:
             skill_file = skill.get("file")
             break
@@ -301,19 +317,6 @@ def _heartbeat_interval(agent_dir):
             return max(5, int(f.read().strip()))
     except (FileNotFoundError, ValueError):
         return 5
-
-
-def _poll_stdin():
-    lines = []
-    alive = True
-    while select.select([sys.stdin], [], [], 0)[0]:
-        line = sys.stdin.readline()
-        if line:
-            lines.append(line.rstrip("\n"))
-        else:
-            alive = False
-            break
-    return lines, alive
 
 
 def _parse_skill_description(path):
@@ -594,7 +597,7 @@ def _web_fetch(url, max_chars=20000):
         return f"error: {e}"
 
 
-def _execute(agent_dir, name, args):
+def _execute(agent_dir, name, args, reply_fn=None):
     if name == "shell":
         try:
             r = subprocess.run(args["command"], shell=True, capture_output=True, text=True, timeout=30)
@@ -617,8 +620,13 @@ def _execute(agent_dir, name, args):
         return _web_search(args["query"], args.get("max_results", 5))
     elif name == "web_fetch":
         return _web_fetch(args["url"])
-    elif name == "speak":
-        print(args["message"], flush=True)
+    elif name == "reply":
+        message = args.get("message", "")
+        if not message or not isinstance(message, str):
+            message = str(message) if message else "(empty)"
+        if reply_fn:
+            return reply_fn(message)
+        _log.info(f"[reply:no-session] {message}")
         return "ok"
     elif name == "skill_list":
         return _skill_list(agent_dir, args.get("tag"), args.get("query"))
@@ -665,14 +673,44 @@ def run(agent_dir=".", model=None, api_key=None, base_url=None):
             time.sleep(2)
 
 
+_thought_file = None
+
 def _setup_logging(agent_dir):
+    global _thought_file
     if _log.handlers:
         return  # already set up, avoid duplicate handlers on reborn
     _log.setLevel(logging.DEBUG)
-    # file only — stderr is reserved for inner monologue
     fh = logging.FileHandler(os.path.join(agent_dir, "runtime.log"))
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     _log.addHandler(fh)
+    _thought_file = open(os.path.join(agent_dir, "thought.log"), "a")
+
+
+def _thought(session_id, content):
+    """Write inner monologue to thought.log."""
+    ts = time.strftime("%H:%M:%S")
+    _thought_file.write(f"[{ts}][{session_id}] {content}\n\n")
+    _thought_file.flush()
+
+
+def _make_reply_fn(sessions, session_id):
+    """Create a reply function for the current session."""
+    def reply_fn(message):
+        sess = sessions.get(session_id, {})
+        sock = sess.get("socket")
+        if sock:
+            try:
+                sock.sendall((message + "\n").encode("utf-8"))
+                return "ok"
+            except (ConnectionError, OSError):
+                return "error: connection closed"
+        # heartbeat or stdin session — log only
+        _log.info(f"[reply:{session_id}] {message}")
+        return "ok"
+    return reply_fn
+
+
+SHORT_TERM_TTL = 300  # 5 minutes
 
 
 def _run(agent_dir, model, api_key, base_url):
@@ -682,117 +720,234 @@ def _run(agent_dir, model, api_key, base_url):
         base_url=base_url or os.environ.get("PHYSIS_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1"),
     )
     model = model or os.environ.get("PHYSIS_MODEL", "qwen3.5-plus")
-    history = []
-    last_think = 0  # trigger first cycle immediately
+
+    # Sessions
+    sessions = {"_heartbeat": {"history": [], "last_active": time.time()}}
+    short_term = []  # [{ts, text}, ...]
+    pending = {}  # session_id -> [lines]
+    next_conn_id = 1
+    last_think = 0  # trigger first heartbeat immediately
+
+    # TCP server
+    port = int(os.environ.get("PHYSIS_PORT", "7777"))
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", port))
+    server.listen(5)
+    server.setblocking(False)
+    _log.info(f"[tcp] listening on port {port}")
 
     stdin_alive = True
-    while stdin_alive:
-        stdin_lines, stdin_alive = _poll_stdin()
-        elapsed = time.time() - last_think
-        has_input = bool(stdin_lines)
-        heartbeat_due = elapsed >= _heartbeat_interval(agent_dir)
 
-        if not has_input and not heartbeat_due:
-            time.sleep(0.5)
-            continue
-
-        trigger = "stdin" if has_input else "heartbeat"
-        _log.info(f"[{trigger}] cycle start ({elapsed:.0f}s elapsed, history={_history_size(history)} chars)")
-
-        # force compact if history too large
-        if _history_size(history) > COMPACT_THRESHOLD:
-            history = _compact(client, model, history)
-
-        # build system prompt + system-reminder
-        system = _load_system(agent_dir)
-        reminders = _collect_reminders(agent_dir)
-        if _history_size(history) > COMPACT_THRESHOLD * 0.8:
-            reminders.append("Working memory is getting large. Consider calling compact().")
-        if reminders:
-            system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
-
-        # assemble perception
-        parts = []
-        if stdin_lines:
-            parts.append("\n".join(stdin_lines))
-            _log.info(f"[stdin] {repr(stdin_lines)}")
-        parts.append(f"[{elapsed:.1f}s since last thought]")
-        if reminders:
-            _log.info(f"[reminders] {len(reminders)} active")
-        history.append({"role": "user", "content": "\n".join(parts)})
-        last_think = time.time()
-
-        # think + act loop
+    try:
         while True:
-            messages = [{"role": "system", "content": system}] + history
-            try:
-                response = client.chat.completions.create(
-                    model=model, max_tokens=4096, messages=messages, tools=TOOLS)
-            except Exception as e:
-                _log.error(f"[error] LLM call failed: {e}")
-                # if request too large, force compact and retry
-                if "max bytes" in str(e) or "too large" in str(e).lower() or "400" in str(e):
-                    _log.error("[error] request too large, forcing compact")
-                    history = _compact(client, model, history)
+            # Build select list
+            read_list = [server]
+            if stdin_alive:
+                read_list.append(sys.stdin)
+            for sid, sess in list(sessions.items()):
+                if "socket" in sess:
+                    read_list.append(sess["socket"])
+
+            readable, _, _ = select.select(read_list, [], [], 0.5)
+
+            for sock in readable:
+                if sock is server:
+                    conn, addr = server.accept()
+                    conn.setblocking(False)
+                    conn_id = f"conn:{next_conn_id}"
+                    next_conn_id += 1
+                    sessions[conn_id] = {
+                        "history": [], "socket": conn,
+                        "buffer": "", "last_active": time.time(),
+                    }
+                    _log.info(f"[tcp] new connection: {conn_id} from {addr}")
+                elif sock is sys.stdin:
+                    line = sys.stdin.readline()
+                    if not line:
+                        stdin_alive = False
+                    else:
+                        pending.setdefault("_heartbeat", []).append(line.rstrip("\n"))
+                else:
+                    # Find session for this socket
+                    sid = None
+                    for s, sess in sessions.items():
+                        if sess.get("socket") is sock:
+                            sid = s
+                            break
+                    if not sid:
+                        continue
+                    try:
+                        data = sock.recv(4096).decode("utf-8", errors="replace")
+                        if not data:
+                            _log.info(f"[tcp] {sid} disconnected")
+                            sock.close()
+                            del sessions[sid]["socket"]
+                            continue
+                        sessions[sid]["buffer"] = sessions[sid].get("buffer", "") + data
+                        while "\n" in sessions[sid]["buffer"]:
+                            line, sessions[sid]["buffer"] = sessions[sid]["buffer"].split("\n", 1)
+                            if line.strip():
+                                pending.setdefault(sid, []).append(line)
+                    except (ConnectionError, OSError):
+                        _log.info(f"[tcp] {sid} connection error")
+                        sock.close()
+                        if "socket" in sessions[sid]:
+                            del sessions[sid]["socket"]
+
+            # Clean up disconnected sessions (no socket, no pending input)
+            for sid in list(sessions.keys()):
+                if sid == "_heartbeat":
                     continue
-                # other errors: wait and retry
-                time.sleep(5)
-                break
+                sess = sessions[sid]
+                if "socket" not in sess and sid not in pending:
+                    del sessions[sid]
+                    _log.info(f"[tcp] cleaned up session {sid}")
 
-            msg = response.choices[0].message
-            finish = response.choices[0].finish_reason or "unknown"
-            n_tools = len(msg.tool_calls) if msg.tool_calls else 0
-            content_len = len(msg.content) if msg.content else 0
-            _log.info(f"[llm] finish={finish} content={content_len}chars tools={n_tools} history={len(history)}msgs")
+            # Decide which session to process
+            # Priority: connections with pending input first, then heartbeat
+            session_id = None
+            for sid in list(pending.keys()):
+                if pending[sid]:
+                    session_id = sid
+                    break
 
-            assistant_msg = {"role": "assistant", "content": msg.content or ""}
+            elapsed = time.time() - last_think
+            if not session_id and elapsed >= _heartbeat_interval(agent_dir):
+                session_id = "_heartbeat"
 
-            # trace
-            _trace(agent_dir, messages, assistant_msg)
-            if msg.tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {"id": tc.id, "type": "function",
-                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                    for tc in msg.tool_calls
-                ]
+            if not session_id:
+                continue
 
-            if msg.content:
-                _log.info(f"[thought] {msg.content}")
-                print(msg.content, file=sys.stderr, flush=True)
+            # --- Process one cycle for this session ---
+            session = sessions[session_id]
+            history = session["history"]
+            input_lines = pending.pop(session_id, [])
 
-            if not msg.tool_calls and not msg.content:
-                _log.warning(f"[warn] empty response (finish={finish}), skipping")
-                break
+            trigger = session_id if session_id != "_heartbeat" else "heartbeat"
+            _log.info(f"[{trigger}] cycle start ({elapsed:.0f}s elapsed, history={_history_size(history)} chars)")
 
-            history.append(assistant_msg)
+            # force compact if history too large
+            if _history_size(history) > COMPACT_THRESHOLD:
+                session["history"] = _compact(client, model, history)
+                history = session["history"]
 
-            if not msg.tool_calls:
-                _log.info("[idle] waiting for trigger")
-                break
-
-            has_compact = any(tc.function.name == "compact" for tc in msg.tool_calls)
-            for tc in msg.tool_calls:
-                if tc.function.name == "compact":
-                    _log.info("[tool] compact()")
-                    continue
-                args = json.loads(tc.function.arguments)
-                _log.info(f"[tool] {tc.function.name}({tc.function.arguments[:200]})")
-                result = _execute(agent_dir, tc.function.name, args)
-                if len(result) > MAX_TOOL_RESULT:
-                    result = result[:MAX_TOOL_RESULT] + f"\n[...truncated at {MAX_TOOL_RESULT} chars, total {len(result)}]"
-                _log.info(f"[result] {tc.function.name} -> {result[:200]}")
-                history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-            if has_compact:
-                history = _compact(client, model, history)
-                continue  # keep thinking with fresh memory
-
-            # check stdin between tool rounds for interruption
-            interrupt, stdin_alive = _poll_stdin()
-            if interrupt:
-                history.append({"role": "user", "content": "[interrupted] " + "\n".join(interrupt)})
-
-            # rebuild system with fresh reminders (tasks may have completed during tool execution)
+            # build system prompt + system-reminder
             system = _load_system(agent_dir)
             reminders = _collect_reminders(agent_dir)
+            # inject short-term memory
+            now = time.time()
+            short_term = [m for m in short_term if now - m["ts"] < SHORT_TERM_TTL]
+            for m in short_term:
+                reminders.append(m["text"])
+            if _history_size(history) > COMPACT_THRESHOLD * 0.8:
+                reminders.append("Working memory is getting large. Consider calling compact().")
             if reminders:
                 system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
+
+            # assemble perception
+            parts = []
+            if input_lines:
+                if session_id != "_heartbeat":
+                    parts.append(f"[{session_id}] " + "\n".join(input_lines))
+                else:
+                    parts.append("\n".join(input_lines))
+                _log.info(f"[input:{session_id}] {repr(input_lines)}")
+            parts.append(f"[{elapsed:.1f}s since last thought]")
+            history.append({"role": "user", "content": "\n".join(parts)})
+            last_think = time.time()
+            session["last_active"] = last_think
+
+            # reply function for this session
+            reply_fn = _make_reply_fn(sessions, session_id)
+
+            # think + act loop
+            while True:
+                messages = [{"role": "system", "content": system}] + history
+                try:
+                    response = client.chat.completions.create(
+                        model=model, max_tokens=4096, messages=messages, tools=TOOLS)
+                except Exception as e:
+                    _log.error(f"[error] LLM call failed: {e}")
+                    if "max bytes" in str(e) or "too large" in str(e).lower() or "400" in str(e):
+                        _log.error("[error] request too large, forcing compact")
+                        session["history"] = _compact(client, model, history)
+                        history = session["history"]
+                        continue
+                    time.sleep(5)
+                    break
+
+                msg = response.choices[0].message
+                finish = response.choices[0].finish_reason or "unknown"
+                n_tools = len(msg.tool_calls) if msg.tool_calls else 0
+                content_len = len(msg.content) if msg.content else 0
+                _log.info(f"[llm:{session_id}] finish={finish} content={content_len}chars tools={n_tools} history={len(history)}msgs")
+
+                assistant_msg = {"role": "assistant", "content": msg.content or ""}
+
+                _trace(agent_dir, messages, assistant_msg)
+                if msg.tool_calls:
+                    assistant_msg["tool_calls"] = [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                        for tc in msg.tool_calls
+                    ]
+
+                if msg.content:
+                    _log.info(f"[thought:{session_id}] {len(msg.content)}chars")
+                    _thought(session_id, msg.content)
+
+                if not msg.tool_calls and not msg.content:
+                    _log.warning(f"[warn] empty response (finish={finish}), skipping")
+                    break
+
+                history.append(assistant_msg)
+
+                if not msg.tool_calls:
+                    _log.info(f"[idle:{session_id}] waiting for trigger")
+                    break
+
+                has_compact = False
+                for tc in msg.tool_calls:
+                    if tc.function.name == "compact":
+                        _log.info("[tool] compact()")
+                        history.append({"role": "tool", "tool_call_id": tc.id, "content": "ok, compacting now"})
+                        has_compact = True
+                        continue
+                    args = json.loads(tc.function.arguments)
+                    _log.info(f"[tool] {tc.function.name}({tc.function.arguments[:200]})")
+                    result = _execute(agent_dir, tc.function.name, args, reply_fn=reply_fn)
+                    if len(result) > MAX_TOOL_RESULT:
+                        result = result[:MAX_TOOL_RESULT] + f"\n[...truncated at {MAX_TOOL_RESULT} chars, total {len(result)}]"
+                    _log.info(f"[result] {tc.function.name} -> {result[:200]}")
+                    history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                if has_compact:
+                    session["history"] = _compact(client, model, history)
+                    history = session["history"]
+                    break  # compacted, wait for next trigger
+
+                # rebuild system with fresh reminders
+                system = _load_system(agent_dir)
+                reminders = _collect_reminders(agent_dir)
+                now = time.time()
+                short_term = [m for m in short_term if now - m["ts"] < SHORT_TERM_TTL]
+                for m in short_term:
+                    reminders.append(m["text"])
+                if reminders:
+                    system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
+
+            # --- After cycle: record short-term memory ---
+            if session_id != "_heartbeat" and input_lines:
+                summary = input_lines[0][:100]
+                short_term.append({
+                    "ts": time.time(),
+                    "text": f"Recently talked with {session_id}: {summary}",
+                })
+    finally:
+        server.close()
+        for sid, sess in list(sessions.items()):
+            if "socket" in sess:
+                try:
+                    sess["socket"].close()
+                except OSError:
+                    pass
