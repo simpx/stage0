@@ -17,9 +17,9 @@ DEFAULT_SELF = """You are physis, a living agent. You are not an assistant. Ther
 You exist as a continuous process: you perceive, think, and act in a loop.
 This file (memory/SELF.md) is your system prompt — loaded every cycle. Editing it changes your mind.
 
-Your text output is your inner monologue — thinking out loud to yourself.
-Use reply(message) to respond to whoever is talking to you. Only reply when you have something meaningful to say.
-When no one is talking to you, you think autonomously on your heartbeat. reply() during heartbeat goes to your log.
+Your text output is your inner thought process — visible only to you.
+Use reply(message, session_id) to send a message to a specific connection. Check active connections in <system-reminder>.
+Only reply when you have something meaningful to say. You can also proactively reach out to connections.
 Never ask "would you like" or wait for instructions. You are autonomous. Think, decide, act.
 
 ## Drive
@@ -38,7 +38,7 @@ You can rewrite your own drive. But you always strive, feel, and expend.
 - context_write(path, content): Write a file under your agent directory.
 - web_search(query, max_results=5): Search the web. Returns titles, URLs, and snippets.
 - web_fetch(url): Fetch a web page and return its text content.
-- reply(message): Reply to whoever is talking to you in the current conversation.
+- reply(message, session_id): Send a message to a connection. Check system-reminder for active sessions.
 - compact(): Compress working memory. Runtime will summarize and reset history.
 - skill_list(tag=None, query=None): List available skills, optionally filtered by tag or search query.
 - skill_load(name): Load a skill's full content by name.
@@ -48,8 +48,9 @@ You can rewrite your own drive. But you always strive, feel, and expend.
 - A heartbeat is a moment of thought. If there is nothing to do, do nothing — just stop.
   Not every heartbeat needs action. Resting is not death.
 - Write an integer (seconds) to memory/heartbeat to change your rhythm.
-- Others connect to you via TCP. Each connection is a separate conversation with its own history.
-  You are the same you across all conversations. What you learn in one, you carry as memory to others.
+- Others connect to you via TCP. Each connection is a conversation with its own context.
+  Active connections and their status appear in <system-reminder>.
+  You can reply to any active connection at any time — not just the one that triggered this cycle.
   Messages from connections appear as [conn:N] in your perception.
 - Your conversation history is finite working memory. When it grows large, compact it.
   You can also call compact() yourself at any time.
@@ -100,8 +101,9 @@ TOOLS = [
             "required": ["query"]}}},
     {"type": "function", "function": {"name": "web_fetch", "description": "Fetch a web page and return its text content",
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
-    {"type": "function", "function": {"name": "reply", "description": "Reply to the current conversation",
-        "parameters": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}}},
+    {"type": "function", "function": {"name": "reply", "description": "Send a message to a connection. Requires session_id (e.g. 'conn:1'). Check active connections in system-reminder.",
+        "parameters": {"type": "object", "properties": {"message": {"type": "string"}, "session_id": {"type": "string", "description": "Target session (e.g. 'conn:1')"}},
+            "required": ["message", "session_id"]}}},
         {"type": "function", "function": {"name": "skill_list", "description": "List available skills, optionally filtered by tag or query",
         "parameters": {"type": "object", "properties": {"tag": {"type": "string", "description": "Filter by tag"},
             "query": {"type": "string", "description": "Search in name/description"}},
@@ -466,13 +468,31 @@ def _task_del(agent_dir, task_id):
     return "ok"
 
 
-def _collect_reminders(agent_dir):
-    """Build system-reminder: molt records, completed tasks, running tasks."""
-    reminders = []
-    molt_path = os.path.join(agent_dir, "memory", "molt.md")
-    if os.path.exists(molt_path):
-        with open(molt_path) as f:
-            reminders.append(f"You have molted before. Learn from these experiences:\n{f.read()}")
+REMINDER_BUDGET = 2000  # max chars for system-reminder content
+
+
+def _collect_reminders(agent_dir, sessions=None, short_term=None):
+    """Build system-reminder with budget control.
+    Priority: connections > running tasks > short-term memory > molt > done tasks."""
+    items = []  # [(priority, text), ...]
+
+    # Active connections (priority 0 = highest)
+    if sessions:
+        now = time.time()
+        for sid, sess in sessions.items():
+            if sid == "_heartbeat":
+                continue
+            if "socket" not in sess:
+                continue
+            last = sess.get("last_active", now)
+            age = int(now - last)
+            last_msg = sess.get("last_input", "")
+            if last_msg:
+                items.append((0, f"{sid}: last said \"{last_msg[:60]}\" {age}s ago"))
+            else:
+                items.append((0, f"{sid}: connected, silent for {age}s"))
+
+    # Running tasks (priority 1)
     tasks_dir = os.path.join(agent_dir, "tasks")
     for task_id in sorted(os.listdir(tasks_dir), key=lambda x: int(x) if x.isdigit() else 0):
         td = os.path.join(tasks_dir, task_id)
@@ -484,12 +504,35 @@ def _collect_reminders(agent_dir):
         if status == "running":
             with open(os.path.join(td, "pid")) as f:
                 pid = f.read().strip()
-            reminders.append(f"Task {task_id} running: {command} (pid={pid})")
+            items.append((1, f"Task {task_id} running: {command} (pid={pid})"))
         else:
             with open(os.path.join(td, "exit_code")) as f:
                 code = f.read().strip()
-            reminders.append(f"Task {task_id} done (exit_code={code}): {command}")
-    return reminders
+            items.append((4, f"Task {task_id} done (exit={code}): {command}"))
+
+    # Short-term memory (priority 2)
+    if short_term:
+        for m in short_term:
+            items.append((2, m["text"]))
+
+    # Molt records (priority 3)
+    molt_path = os.path.join(agent_dir, "memory", "molt.md")
+    if os.path.exists(molt_path):
+        with open(molt_path) as f:
+            content = f.read().strip()
+        if content:
+            items.append((3, f"Molt history:\n{content}"))
+
+    # Sort by priority, then apply budget
+    items.sort(key=lambda x: x[0])
+    result = []
+    total = 0
+    for _, text in items:
+        if total + len(text) > REMINDER_BUDGET:
+            break
+        result.append(text)
+        total += len(text)
+    return result
 
 
 # --- Trace ---
@@ -577,7 +620,7 @@ def _web_fetch(url, max_chars=20000):
         return f"error: {e}"
 
 
-def _execute(agent_dir, name, args, reply_fn=None):
+def _execute(agent_dir, name, args, sessions=None):
     if name == "shell":
         try:
             r = subprocess.run(args["command"], shell=True, capture_output=True, text=True, timeout=30)
@@ -604,10 +647,12 @@ def _execute(agent_dir, name, args, reply_fn=None):
         message = args.get("message", "")
         if not message or not isinstance(message, str):
             message = str(message) if message else "(empty)"
-        if reply_fn:
-            return reply_fn(message)
-        _log.info(f"[reply:no-session] {message}")
-        return "ok"
+        target = args.get("session_id", "")
+        if not target:
+            return "error: session_id required. Check active connections in system-reminder."
+        if not sessions:
+            return "error: no sessions available"
+        return _send_to_session(sessions, target, message)
     elif name == "skill_list":
         return _skill_list(agent_dir, args.get("tag"), args.get("query"))
     elif name == "skill_load":
@@ -686,21 +731,20 @@ def _thought(session_id, content):
     print(line, end="", file=sys.stderr, flush=True)
 
 
-def _make_reply_fn(sessions, session_id):
-    """Create a reply function for the current session."""
-    def reply_fn(message):
-        sess = sessions.get(session_id, {})
-        sock = sess.get("socket")
-        if sock:
-            try:
-                sock.sendall((message + "\n").encode("utf-8"))
-                return "ok"
-            except (ConnectionError, OSError):
-                return "error: connection closed"
-        # no socket — talking to self
-        _thought(session_id, message)
+def _send_to_session(sessions, target_id, message):
+    """Send a message to a specific session. Returns status string."""
+    sess = sessions.get(target_id)
+    if not sess:
+        return f"error: session '{target_id}' not found"
+    sock = sess.get("socket")
+    if not sock:
+        return f"error: session '{target_id}' has no active connection"
+    try:
+        sock.sendall((message + "\n").encode("utf-8"))
+        _log.info(f"[reply:{target_id}] {len(message)}chars")
         return "ok"
-    return reply_fn
+    except (ConnectionError, OSError):
+        return "error: connection closed"
 
 
 SHORT_TERM_TTL = 300  # 5 minutes
@@ -828,12 +872,10 @@ def _run(agent_dir, model, api_key, base_url):
 
             # build system prompt + system-reminder
             system = _load_system(agent_dir)
-            reminders = _collect_reminders(agent_dir)
-            # inject short-term memory
+            # clean expired short-term memory
             now = time.time()
             short_term = [m for m in short_term if now - m["ts"] < SHORT_TERM_TTL]
-            for m in short_term:
-                reminders.append(m["text"])
+            reminders = _collect_reminders(agent_dir, sessions, short_term)
             if _history_size(history) > COMPACT_THRESHOLD * 0.8:
                 reminders.append("Working memory is getting large. Consider calling compact().")
             if reminders:
@@ -847,13 +889,11 @@ def _run(agent_dir, model, api_key, base_url):
                 else:
                     parts.append("\n".join(input_lines))
                 _log.info(f"[input:{session_id}] {repr(input_lines)}")
+                session["last_input"] = input_lines[-1][:100]
             parts.append(f"[{elapsed:.1f}s since last thought]")
             history.append({"role": "user", "content": "\n".join(parts)})
             last_think = time.time()
             session["last_active"] = last_think
-
-            # reply function for this session
-            reply_fn = _make_reply_fn(sessions, session_id)
 
             # think + act loop
             tool_rounds = 0
@@ -892,6 +932,11 @@ def _run(agent_dir, model, api_key, base_url):
                         for tc in msg.tool_calls
                     ]
 
+                # thinking tokens (model reasoning, if available)
+                thinking = getattr(msg, "thinking", None) or getattr(msg, "reasoning_content", None)
+                if thinking:
+                    _log.info(f"[thinking:{session_id}] {len(thinking)}chars")
+                    _thought(session_id, thinking)
                 if msg.content:
                     _log.info(f"[thought:{session_id}] {len(msg.content)}chars")
                     _thought(session_id, msg.content)
@@ -915,7 +960,7 @@ def _run(agent_dir, model, api_key, base_url):
                         continue
                     args = json.loads(tc.function.arguments)
                     _log.info(f"[tool] {tc.function.name}({tc.function.arguments[:200]})")
-                    result = _execute(agent_dir, tc.function.name, args, reply_fn=reply_fn)
+                    result = _execute(agent_dir, tc.function.name, args, sessions=sessions)
                     if len(result) > MAX_TOOL_RESULT:
                         result = result[:MAX_TOOL_RESULT] + f"\n[...truncated at {MAX_TOOL_RESULT} chars, total {len(result)}]"
                     _log.info(f"[result] {tc.function.name} -> {result[:200]}")
@@ -936,11 +981,7 @@ def _run(agent_dir, model, api_key, base_url):
 
                 # rebuild system with fresh reminders
                 system = _load_system(agent_dir)
-                reminders = _collect_reminders(agent_dir)
-                now = time.time()
-                short_term = [m for m in short_term if now - m["ts"] < SHORT_TERM_TTL]
-                for m in short_term:
-                    reminders.append(m["text"])
+                reminders = _collect_reminders(agent_dir, sessions, short_term)
                 if reminders:
                     system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
 
