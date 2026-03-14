@@ -626,6 +626,54 @@ def _thought(session_id, content):
     print(line, end="", file=sys.stderr, flush=True)
 
 
+class _StatusLine:
+    """A single-line stderr display showing recent operation timeline."""
+    def __init__(self, max_items=10):
+        self.items = []  # [(label, duration), ...] completed
+        self.max_items = max_items
+        self.current = None  # (label, start_time)
+        self.session_id = ""
+
+    def begin(self, session_id, label):
+        self._finish_current()
+        self.session_id = session_id
+        self.current = (label, time.time())
+        self._render()
+
+    def end(self):
+        self._finish_current()
+        self._render()
+
+    def clear(self):
+        self._finish_current()
+        self.items = []
+        print(f"\r\033[K", end="", file=sys.stderr, flush=True)
+
+    def _finish_current(self):
+        if self.current:
+            label, start = self.current
+            dur = time.time() - start
+            self.items.append((label, dur))
+            self.items = self.items[-self.max_items:]
+            self.current = None
+
+    def _render(self):
+        parts = []
+        for label, dur in self.items:
+            parts.append(f"[{label} {dur:.1f}s]")
+        if self.current:
+            label, start = self.current
+            dur = time.time() - start
+            parts.append(f"[{label} {dur:.1f}s...]")
+        line = f"{self.session_id} " + " ".join(parts)
+        # truncate to terminal width (assume 120)
+        if len(line) > 119:
+            line = line[-119:]
+        print(f"\r\033[K{line}", end="", file=sys.stderr, flush=True)
+
+_sl = _StatusLine()
+
+
 # --- Heartbeat ---
 
 
@@ -676,6 +724,7 @@ def _run(agent_dir, model, api_key, base_url):
     client = OpenAI(
         api_key=api_key or os.environ.get("PHYSIS_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
         base_url=base_url or os.environ.get("PHYSIS_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1"),
+        timeout=180,
     )
     model = model or os.environ.get("PHYSIS_MODEL", "qwen3.5-plus")
 
@@ -765,6 +814,7 @@ def _run(agent_dir, model, api_key, base_url):
 
             trigger = session_id if session_id != "_heartbeat" else "heartbeat"
             _log.info(f"[{trigger}] cycle start ({elapsed:.0f}s elapsed, history={_history_size(history)} chars)")
+            _sl.clear()
 
             if _history_size(history) > COMPACT_THRESHOLD:
                 session["history"] = _compact(client, model, history)
@@ -793,6 +843,7 @@ def _run(agent_dir, model, api_key, base_url):
                     _log.warning(f"[break:{session_id}] max tool rounds ({MAX_TOOL_ROUNDS}) reached")
                     break
 
+                _sl.begin(session_id, "llm")
                 messages = [{"role": "system", "content": system}] + history
                 try:
                     response = client.chat.completions.create(
@@ -807,6 +858,7 @@ def _run(agent_dir, model, api_key, base_url):
                     break
 
                 msg = response.choices[0].message
+                _sl.end()  # end llm timing
                 finish = response.choices[0].finish_reason or "unknown"
                 n_tools = len(msg.tool_calls) if msg.tool_calls else 0
                 _log.info(f"[llm:{session_id}] finish={finish} content={len(msg.content or '')}chars tools={n_tools} history={len(history)}msgs")
@@ -837,6 +889,7 @@ def _run(agent_dir, model, api_key, base_url):
 
                 if not msg.tool_calls:
                     _log.info(f"[idle:{session_id}] waiting for trigger")
+                    _sl.clear()
                     break
 
                 # Execute tools
@@ -848,6 +901,7 @@ def _run(agent_dir, model, api_key, base_url):
                         has_compact = True
                         continue
                     args = json.loads(tc.function.arguments)
+                    _sl.begin(session_id, tc.function.name)
                     _log.info(f"[tool] {tc.function.name}({tc.function.arguments[:200]})")
                     result = _execute(agent_dir, tc.function.name, args, sessions=sessions)
                     if len(result) > MAX_TOOL_RESULT:
