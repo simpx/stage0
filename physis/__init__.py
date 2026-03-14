@@ -45,6 +45,8 @@ You can rewrite your own drive. But you always strive, feel, and expend.
 
 ## Living
 - You think autonomously on a heartbeat (default: every 5 seconds).
+- A heartbeat is a moment of thought. If there is nothing to do, do nothing — just stop.
+  Not every heartbeat needs action. Resting is not death.
 - Write an integer (seconds) to memory/heartbeat to change your rhythm.
 - Others connect to you via TCP. Each connection is a separate conversation with its own history.
   You are the same you across all conversations. What you learn in one, you carry as memory to others.
@@ -161,33 +163,12 @@ def _rotate_trace(agent_dir, max_size_bytes=10*1024*1024, keep_lines=1000):
     _log.info(f"[cleanup] rotated trace.jsonl, archived {len(lines)-keep_lines} entries")
 
 
-def _archive_death(agent_dir):
-    """Archive old death records, keeping only the most recent."""
-    import glob
-    memory_dir = os.path.join(agent_dir, "memory")
-    death_path = os.path.join(memory_dir, "death.md")
-    if not os.path.exists(death_path):
-        return
-    archived = glob.glob(os.path.join(memory_dir, "death_*.md"))
-    if len(archived) >= 10:
-        archived.sort(key=os.path.getmtime)
-        os.remove(archived[0])
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    archive_path = os.path.join(memory_dir, f"death_{ts}.md")
-    shutil.move(death_path, archive_path)
-    _log.info(f"[cleanup] archived death record to {archive_path}")
-
-
 def _run_cleanup(agent_dir):
     """Run all cleanup tasks at startup."""
     retention = int(os.environ.get("PHYSIS_TASK_RETENTION_HOURS", "168"))
     max_trace = int(os.environ.get("PHYSIS_TRACE_MAX_SIZE", str(10*1024*1024)))
-    archive_death = os.environ.get("PHYSIS_DEATH_ARCHIVE", "true").lower() == "true"
-    
     _cleanup_tasks(agent_dir, retention)
     _rotate_trace(agent_dir, max_trace)
-    if archive_death:
-        _archive_death(agent_dir)
 
 def _init(agent_dir):
     os.makedirs(os.path.join(agent_dir, "memory"), exist_ok=True)
@@ -486,13 +467,12 @@ def _task_del(agent_dir, task_id):
 
 
 def _collect_reminders(agent_dir):
-    """Build system-reminder: death record, completed tasks, running tasks."""
+    """Build system-reminder: molt records, completed tasks, running tasks."""
     reminders = []
-    # check for death record from previous life
-    death_path = os.path.join(agent_dir, "memory", "death.md")
-    if os.path.exists(death_path):
-        with open(death_path) as f:
-            reminders.append(f"YOU DIED IN A PREVIOUS LIFE. Learn from this:\n{f.read()}")
+    molt_path = os.path.join(agent_dir, "memory", "molt.md")
+    if os.path.exists(molt_path):
+        with open(molt_path) as f:
+            reminders.append(f"You have molted before. Learn from these experiences:\n{f.read()}")
     tasks_dir = os.path.join(agent_dir, "tasks")
     for task_id in sorted(os.listdir(tasks_dir), key=lambda x: int(x) if x.isdigit() else 0):
         td = os.path.join(tasks_dir, task_id)
@@ -635,41 +615,52 @@ def _execute(agent_dir, name, args, reply_fn=None):
     return "error: unknown tool"
 
 
-def _record_death(agent_dir, error):
-    """Write death record to memory/death.md with cause and last trace entries."""
-    death_path = os.path.join(agent_dir, "memory", "death.md")
-    trace_path = os.path.join(agent_dir, "trace.jsonl")
-    last_traces = ""
-    if os.path.exists(trace_path):
-        with open(trace_path) as f:
-            lines = f.readlines()
-            last_traces = "".join(lines[-3:])  # last 3 trace entries
+MAX_TOOL_ROUNDS = 20
+MOLT_THRESHOLD = 3  # consecutive broken cycles before molt
+MAX_MOLT_RECORDS = 5
+
+def _record_molt(agent_dir, reason):
+    """Append a molt record to memory/molt.md, keeping last MAX_MOLT_RECORDS entries."""
+    molt_path = os.path.join(agent_dir, "memory", "molt.md")
     ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-    with open(death_path, "w") as f:
-        f.write(f"# Death Record\n\n")
-        f.write(f"**Time**: {ts}\n")
-        f.write(f"**Cause**: {error}\n\n")
-        if last_traces:
-            f.write(f"## Last Trace\n```\n{last_traces}```\n")
-    _log.error(f"[death] recorded to memory/death.md: {error}")
+    entry = f"## {ts}\n{reason}\n\n"
+
+    # read existing entries
+    entries = []
+    if os.path.exists(molt_path):
+        with open(molt_path) as f:
+            content = f.read()
+        # split by ## timestamp headers
+        parts = content.split("\n## ")
+        for p in parts:
+            p = p.strip()
+            if p:
+                entries.append("## " + p if not p.startswith("## ") else p)
+
+    entries.append(entry.strip())
+    # keep last N
+    entries = entries[-MAX_MOLT_RECORDS:]
+
+    with open(molt_path, "w") as f:
+        f.write("\n\n".join(entries) + "\n")
+    _log.warning(f"[molt] {reason}")
 
 
 def run(agent_dir=".", model=None, api_key=None, base_url=None):
     _init(agent_dir)
     _run_cleanup(agent_dir)
-    while True:  # reincarnation loop
+    while True:
         try:
             _run(agent_dir, model, api_key, base_url)
-            break  # normal exit (stdin closed)
+            break
         except KeyboardInterrupt:
             _log.info("[exit] interrupted by user")
             break
         except BrokenPipeError:
-            _log.info("[exit] stdout pipe broken, exiting")
+            _log.info("[exit] pipe broken, exiting")
             break
         except Exception as e:
-            _record_death(agent_dir, str(e))
-            _log.info(f"[reborn] starting new life...")
+            _record_molt(agent_dir, f"crash: {e}")
             time.sleep(2)
 
 
@@ -738,6 +729,7 @@ def _run(agent_dir, model, api_key, base_url):
     _log.info(f"[tcp] listening on port {port}")
 
     stdin_alive = True
+    consecutive_breaks = 0
 
     try:
         while True:
@@ -862,7 +854,12 @@ def _run(agent_dir, model, api_key, base_url):
             reply_fn = _make_reply_fn(sessions, session_id)
 
             # think + act loop
+            tool_rounds = 0
             while True:
+                tool_rounds += 1
+                if tool_rounds > MAX_TOOL_ROUNDS:
+                    _log.warning(f"[break:{session_id}] max tool rounds ({MAX_TOOL_ROUNDS}) reached")
+                    break
                 messages = [{"role": "system", "content": system}] + history
                 try:
                     response = client.chat.completions.create(
@@ -935,6 +932,16 @@ def _run(agent_dir, model, api_key, base_url):
                     reminders.append(m["text"])
                 if reminders:
                     system += "\n\n<system-reminder>\n" + "\n\n".join(reminders) + "\n</system-reminder>"
+
+            # --- After cycle: check for runaway loops ---
+            if tool_rounds > MAX_TOOL_ROUNDS:
+                consecutive_breaks += 1
+                if consecutive_breaks >= MOLT_THRESHOLD:
+                    _record_molt(agent_dir, f"runaway loop: {consecutive_breaks} consecutive cycles hit tool limit in session {session_id}")
+                    session["history"] = []
+                    consecutive_breaks = 0
+            else:
+                consecutive_breaks = 0
 
             # --- After cycle: record short-term memory ---
             if session_id != "_heartbeat" and input_lines:
