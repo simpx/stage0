@@ -14,4 +14,4 @@ dependencies = ["openai>=1.0", "ddgs>=9.0", "beautifulsoup4>=4.12", "rich>=13.0"
 packages = ["physis"]
 
 [project.scripts]
-physis = "physis:run"
+physis = "physis:main"

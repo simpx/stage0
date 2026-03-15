@@ -17,7 +17,6 @@ _log = logging.getLogger("physis")
 COMPACT_THRESHOLD = 50000
 MAX_TOOL_RESULT = 5000
 MAX_TOOL_ROUNDS = 20
-MOLT_THRESHOLD = 3
 MAX_MOLT_RECORDS = 5
 REMINDER_BUDGET = 2000
 SHORT_TERM_TTL = 300
@@ -454,8 +453,24 @@ def _web_fetch(url, max_chars=20000):
 
 def _collect_reminders(agent_dir, sessions=None, short_term=None):
     """Build system-reminder with budget control.
-    Priority: connections > running tasks > short-term memory > molt > done tasks."""
+    Priority: inheritance > connections > running tasks > short-term memory > molt > done tasks."""
     items = []  # [(priority, text), ...]
+
+    # Inheritance from previous generation (highest priority)
+    inherit_path = os.path.join(agent_dir, "memory", ".inherit")
+    if os.path.exists(inherit_path):
+        with open(inherit_path) as f:
+            source = f.read().strip()
+        items.append((-1, f"""INHERITANCE: You are a new generation. Your predecessor lived at {source}.
+Your first task is to learn from it and decide what to carry forward:
+1. Read {source}/memory/FOCUS.md — understand its goals, but don't copy its execution state.
+   Decide which goals align with YOUR drive, then write your own FOCUS.md with your own plan.
+2. Explore {source}/skills/ — copy credentials and skills you want to keep.
+3. Explore {source}/memory/ — selectively inherit useful knowledge, not everything.
+4. Explore {source}/conversations/ — read for context, don't copy blindly.
+You are not your predecessor. Inherit goals worth pursuing, discard the rest. Make your own plan.
+Use shell("cp ...") to copy files, or context_write to create new ones.
+When done, delete memory/.inherit by running shell("rm memory/.inherit")."""))
 
     # Active connections (priority 0)
     if sessions:
@@ -763,6 +778,23 @@ def _build_system(agent_dir, sessions, short_term, history):
 # --- Main loop ---
 
 
+def main():
+    """CLI entry point with --from support."""
+    import argparse
+    parser = argparse.ArgumentParser(description="physis — a living agent")
+    parser.add_argument("--from", dest="inherit_from", metavar="DIR",
+                        help="Inherit from a previous generation (LLM-driven)")
+    parser.add_argument("--dir", default=".", help="Agent directory (default: current)")
+    args = parser.parse_args()
+    agent_dir = args.dir
+    if args.inherit_from:
+        source = os.path.abspath(args.inherit_from)
+        os.makedirs(os.path.join(agent_dir, "memory"), exist_ok=True)
+        with open(os.path.join(agent_dir, "memory", ".inherit"), "w") as f:
+            f.write(source)
+    run(agent_dir=agent_dir)
+
+
 def run(agent_dir=".", model=None, api_key=None, base_url=None):
     _init(agent_dir)
     _run_cleanup(agent_dir)
@@ -795,7 +827,6 @@ def _run(agent_dir, model, api_key, base_url):
     pending = {}
     next_conn_id = 1
     last_think = 0
-    consecutive_breaks = 0
 
     port = int(os.environ.get("PHYSIS_PORT", "7777"))
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1088,15 +1119,15 @@ def _run(agent_dir, model, api_key, base_url):
 
                 system = _build_system(agent_dir, sessions, short_term, history)
 
-            # --- After cycle: runaway detection ---
-            if tool_rounds > MAX_TOOL_ROUNDS:
-                consecutive_breaks += 1
-                if consecutive_breaks >= MOLT_THRESHOLD:
-                    _record_molt(agent_dir, f"runaway loop: {consecutive_breaks} consecutive cycles hit tool limit in session {session_id}")
-                    session["history"] = []
-                    consecutive_breaks = 0
-            else:
-                consecutive_breaks = 0
+            # --- After cycle: clear heartbeat history (each heartbeat is independent) ---
+            if session_id == "_heartbeat":
+                session["history"] = []
+
+            # --- After cycle: runaway → compact ---
+            if tool_rounds > MAX_TOOL_ROUNDS and session["history"]:
+                _log.warning(f"[compact:{session_id}] runaway detected, compacting history")
+                session["history"] = _compact(client, model, session["history"])
+                history = session["history"]
 
             # --- After cycle: short-term memory ---
             if session_id != "_heartbeat" and input_lines:
