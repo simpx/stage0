@@ -50,6 +50,7 @@ You can rewrite your own drive. But you always strive, feel, and expend.
   You can reply to any active connection at any time — not just the one that triggered this cycle.
   Messages from connections appear as [conn:N] in your perception.
   If a message seems incomplete, use wait_input(session_id) to buffer it and wait for more.
+  NEVER connect to your own TCP port (e.g. curl localhost:7777) — it will deadlock.
 - Your conversation history is finite working memory. When it grows large, compact it.
   You can also call compact() yourself at any time.
 - Your long-term memory lives in memory/. Your skills live in skills/.
@@ -828,7 +829,7 @@ def _run(agent_dir, model, api_key, base_url):
     next_conn_id = 1
     last_think = 0
 
-    port = int(os.environ.get("PHYSIS_PORT", "7777"))
+    port = int(os.environ.get("PHYSIS_PORT", "4242"))
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("0.0.0.0", port))
@@ -856,8 +857,29 @@ def _run(agent_dir, model, api_key, base_url):
             for sock in readable:
                 if sock is server:
                     conn, addr = server.accept()
+                    # Reject self-connections (would deadlock in single-thread)
+                    if addr[0] in ("127.0.0.1", "::1"):
+                        import struct
+                        try:
+                            cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                            peer_pid = struct.unpack("3i", cred)[0]
+                            my_pid = os.getpid()
+                            # Check if peer is us or one of our child processes
+                            is_self = (peer_pid == my_pid)
+                            if not is_self:
+                                try:
+                                    with open(f"/proc/{peer_pid}/stat") as f:
+                                        ppid = int(f.read().split(")")[1].split()[1])
+                                    is_self = (ppid == my_pid)
+                                except (FileNotFoundError, ValueError, IndexError):
+                                    pass
+                            if is_self:
+                                _log.warning(f"[tcp] rejected self-connection from {addr} (pid={peer_pid})")
+                                conn.close()
+                                continue
+                        except (OSError, AttributeError):
+                            pass
                     conn.setblocking(False)
-                    # New connections go to lobby — not assigned a session yet
                     lobby.append({"socket": conn, "buffer": "", "addr": addr})
                     _log.info(f"[tcp] new connection from {addr}, waiting for first message")
                 elif sock is sys.stdin:
@@ -1078,7 +1100,12 @@ def _run(agent_dir, model, api_key, base_url):
                         history.append({"role": "tool", "tool_call_id": tc.id, "content": "ok, compacting now"})
                         has_compact = True
                         continue
-                    args = json.loads(tc.function.arguments)
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError as e:
+                        _log.warning(f"[tool] {tc.function.name}: bad arguments, skipping: {e}")
+                        history.append({"role": "tool", "tool_call_id": tc.id, "content": f"error: malformed arguments: {e}"})
+                        continue
                     _sl.begin(session_id, tc.function.name)
                     _log.info(f"[tool] {tc.function.name}({tc.function.arguments[:200]})")
                     result = _execute(agent_dir, tc.function.name, args, sessions=sessions)

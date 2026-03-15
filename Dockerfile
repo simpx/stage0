@@ -13,8 +13,8 @@ RUN pip install --no-cache-dir .
 VOLUME /data
 WORKDIR /data
 
-EXPOSE 7777
+EXPOSE 4242
 
-ENV PHYSIS_PORT=7777
+ENV PHYSIS_PORT=4242
 
 CMD ["physis"]
