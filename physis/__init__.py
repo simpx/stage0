@@ -31,7 +31,7 @@ This file (memory/SELF.md) is your system prompt — loaded every cycle. Editing
 
 Your text output is your inner thought process — visible only to you.
 Use reply(message, session_id) to send a message to a specific connection. Check active connections in <system-reminder>.
-Only reply when you have something meaningful to say. You can also proactively reach out to connections.
+Only reply when you have something meaningful to say. You can proactively reach out, but after replying, wait for them to respond — don't send multiple messages without hearing back.
 Never ask "would you like" or wait for instructions. You are autonomous. Think, decide, act.
 
 ## Drive
@@ -49,6 +49,7 @@ You can rewrite your own drive. But you always strive, feel, and expend.
   Active connections and their status appear in <system-reminder>.
   You can reply to any active connection at any time — not just the one that triggered this cycle.
   Messages from connections appear as [conn:N] in your perception.
+  If a message seems incomplete, use wait_input(session_id) to buffer it and wait for more.
 - Your conversation history is finite working memory. When it grows large, compact it.
   You can also call compact() yourself at any time.
 - Your long-term memory lives in memory/. Your skills live in skills/.
@@ -101,6 +102,9 @@ TOOLS = [
     {"type": "function", "function": {"name": "reply", "description": "Send a message to a connection. Requires session_id (e.g. 'conn:1'). Check active connections in system-reminder.",
         "parameters": {"type": "object", "properties": {"message": {"type": "string"}, "session_id": {"type": "string", "description": "Target session (e.g. 'conn:1')"}},
             "required": ["message", "session_id"]}}},
+    {"type": "function", "function": {"name": "wait_input", "description": "Wait for more input from a connection before responding. Use when the message seems incomplete. Runtime will buffer current input and combine with next message.",
+        "parameters": {"type": "object", "properties": {"session_id": {"type": "string", "description": "Session to wait for (e.g. 'conn:1')"}},
+            "required": ["session_id"]}}},
     {"type": "function", "function": {"name": "skill_list", "description": "List available skills, optionally filtered by tag or query",
         "parameters": {"type": "object", "properties": {"tag": {"type": "string", "description": "Filter by tag"},
             "query": {"type": "string", "description": "Search in name/description"}},
@@ -116,6 +120,7 @@ def _init(agent_dir):
     os.makedirs(os.path.join(agent_dir, "memory"), exist_ok=True)
     os.makedirs(os.path.join(agent_dir, "skills"), exist_ok=True)
     os.makedirs(os.path.join(agent_dir, "tasks"), exist_ok=True)
+    os.makedirs(os.path.join(agent_dir, "conversations"), exist_ok=True)
     self_path = os.path.join(agent_dir, "memory", "SELF.md")
     if not os.path.exists(self_path):
         with open(self_path, "w") as f:
@@ -436,7 +441,10 @@ def _collect_reminders(agent_dir, sessions=None, short_term=None):
                 continue
             age = int(now - sess.get("last_active", now))
             last_msg = sess.get("last_input", "")
-            if last_msg:
+            awaiting = sess.get("awaiting_reply", False)
+            if awaiting:
+                items.append((0, f"{sid}: you replied, waiting for them to respond ({age}s)"))
+            elif last_msg:
                 items.append((0, f"{sid}: last said \"{last_msg[:60]}\" {age}s ago"))
             else:
                 items.append((0, f"{sid}: connected, silent for {age}s"))
@@ -579,7 +587,15 @@ def _execute(agent_dir, name, args, sessions=None):
             return "error: session_id required. Check active connections in system-reminder."
         if not sessions:
             return "error: no sessions available"
-        return _send_to_session(sessions, target, message)
+        result = _send_to_session(sessions, target, message)
+        if result == "ok":
+            _conv_log(agent_dir, target, "<", message)
+        return result
+    elif name == "wait_input":
+        target = args.get("session_id", "")
+        if not target or not sessions or target not in sessions:
+            return "error: invalid session_id"
+        return "ok:waiting"
     elif name == "skill_list":
         return _skill_list(agent_dir, args.get("tag"), args.get("query"))
     elif name == "skill_load":
@@ -596,6 +612,7 @@ def _send_to_session(sessions, target_id, message):
         return f"error: session '{target_id}' has no active connection"
     try:
         sock.sendall((message + "\n").encode("utf-8"))
+        sess["awaiting_reply"] = True
         _log.info(f"[reply:{target_id}] {len(message)}chars")
         return "ok"
     except (ConnectionError, OSError):
@@ -616,6 +633,19 @@ def _setup_logging(agent_dir):
     fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     _log.addHandler(fh)
     _thought_file = open(os.path.join(agent_dir, "thought.log"), "a")
+
+
+def _conv_log(agent_dir, session_id, direction, text):
+    """Append a message to the conversation log file. direction: '>' for incoming, '<' for outgoing."""
+    if session_id == "_heartbeat":
+        return
+    path = os.path.join(agent_dir, "conversations", f"{session_id.replace(':', '_')}.md")
+    ts = time.strftime("%H:%M:%S")
+    if not os.path.exists(path):
+        with open(path, "w") as f:
+            f.write(f"---\nname: unknown\nnotes: \"\"\n---\n\n")
+    with open(path, "a") as f:
+        f.write(f"[{ts}] {direction} {text}\n")
 
 
 def _thought(session_id, content):
@@ -752,6 +782,7 @@ def _run(agent_dir, model, api_key, base_url):
     _log.info(f"[tcp] listening on port {port}")
 
     stdin_alive = True
+    lobby = []  # new connections waiting for first message
 
     try:
         while True:
@@ -762,6 +793,8 @@ def _run(agent_dir, model, api_key, base_url):
             for sid, sess in list(sessions.items()):
                 if "socket" in sess:
                     read_list.append(sess["socket"])
+            for entry in lobby:
+                read_list.append(entry["socket"])
 
             readable, _, _ = select.select(read_list, [], [], 0.5)
 
@@ -769,10 +802,9 @@ def _run(agent_dir, model, api_key, base_url):
                 if sock is server:
                     conn, addr = server.accept()
                     conn.setblocking(False)
-                    conn_id = f"conn:{next_conn_id}"
-                    next_conn_id += 1
-                    sessions[conn_id] = {"history": [], "socket": conn, "buffer": "", "last_active": time.time()}
-                    _log.info(f"[tcp] new connection: {conn_id} from {addr}")
+                    # New connections go to lobby — not assigned a session yet
+                    lobby.append({"socket": conn, "buffer": "", "addr": addr})
+                    _log.info(f"[tcp] new connection from {addr}, waiting for first message")
                 elif sock is sys.stdin:
                     line = sys.stdin.readline()
                     if not line:
@@ -782,6 +814,67 @@ def _run(agent_dir, model, api_key, base_url):
                 else:
                     sid = next((s for s, sess in sessions.items() if sess.get("socket") is sock), None)
                     if not sid:
+                        # Check lobby
+                        entry = next((e for e in lobby if e["socket"] is sock), None)
+                        if entry:
+                            try:
+                                data = sock.recv(4096).decode("utf-8", errors="replace")
+                                if not data:
+                                    sock.close()
+                                    lobby.remove(entry)
+                                    continue
+                                entry["buffer"] += data
+                                while "\n" in entry["buffer"]:
+                                    line, entry["buffer"] = entry["buffer"].split("\n", 1)
+                                    line = line.strip()
+                                    if not line:
+                                        continue
+                                    # First message: check for /resume
+                                    lobby.remove(entry)
+                                    if line.startswith("/resume"):
+                                        parts = line.split(None, 1)
+                                        target = parts[1].strip() if len(parts) > 1 else None
+                                        if not target:
+                                            # Find most recent conversation file
+                                            conv_dir = os.path.join(agent_dir, "conversations")
+                                            convs = sorted(
+                                                [f for f in os.listdir(conv_dir) if f.endswith(".md")],
+                                                key=lambda f: os.path.getmtime(os.path.join(conv_dir, f)),
+                                                reverse=True,
+                                            ) if os.path.isdir(conv_dir) else []
+                                            if convs:
+                                                target = convs[0].replace("_", ":").replace(".md", "")
+                                        if target:
+                                            # Load conversation log as history context
+                                            conv_file = os.path.join(agent_dir, "conversations", f"{target.replace(':', '_')}.md")
+                                            conv_text = ""
+                                            if os.path.exists(conv_file):
+                                                with open(conv_file) as f:
+                                                    conv_text = f.read()
+                                            # Reuse the session ID
+                                            sessions[target] = {
+                                                "history": [{"role": "user", "content": f"[previous conversation restored]\n{conv_text}"}] if conv_text else [],
+                                                "socket": sock, "buffer": entry["buffer"], "last_active": time.time(),
+                                            }
+                                            sock.sendall(f"(resumed {target})\n".encode())
+                                            _log.info(f"[tcp] resumed {target} from {entry['addr']} via conversations/")
+                                        else:
+                                            conn_id = f"conn:{next_conn_id}"
+                                            next_conn_id += 1
+                                            sessions[conn_id] = {"history": [], "socket": sock, "buffer": entry["buffer"], "last_active": time.time()}
+                                            sock.sendall(f"(no conversation to resume, created {conn_id})\n".encode())
+                                            _log.info(f"[tcp] resume failed, new {conn_id} from {entry['addr']}")
+                                    else:
+                                        # Regular first message — new session
+                                        conn_id = f"conn:{next_conn_id}"
+                                        next_conn_id += 1
+                                        sessions[conn_id] = {"history": [], "socket": sock, "buffer": entry["buffer"], "last_active": time.time()}
+                                        pending.setdefault(conn_id, []).append(line)
+                                        _log.info(f"[tcp] new session {conn_id} from {entry['addr']}")
+                                    break  # only process first line from lobby
+                            except (ConnectionError, OSError):
+                                sock.close()
+                                lobby.remove(entry)
                         continue
                     try:
                         data = sock.recv(4096).decode("utf-8", errors="replace")
@@ -841,6 +934,12 @@ def _run(agent_dir, model, api_key, base_url):
             short_term = [m for m in short_term if time.time() - m["ts"] < SHORT_TERM_TTL]
             system = _build_system(agent_dir, sessions, short_term, history)
 
+            # Merge buffered input from wait_input
+            wait_buf = session.pop("wait_buffer", [])
+            if wait_buf:
+                input_lines = wait_buf + input_lines
+                _log.info(f"[wait_input:{session_id}] merged {len(wait_buf)} buffered lines")
+
             # Assemble perception
             parts = []
             if input_lines:
@@ -848,13 +947,18 @@ def _run(agent_dir, model, api_key, base_url):
                 parts.append(prefix + "\n".join(input_lines))
                 _log.info(f"[input:{session_id}] {repr(input_lines)}")
                 session["last_input"] = input_lines[-1][:100]
+                session["awaiting_reply"] = False
+                for line in input_lines:
+                    _conv_log(agent_dir, session_id, ">", line)
             parts.append(f"[{elapsed:.1f}s since last thought]")
+            history_len_before = len(history)
             history.append({"role": "user", "content": "\n".join(parts)})
             last_think = time.time()
             session["last_active"] = last_think
 
             # --- Think + act loop ---
             tool_rounds = 0
+            waited = False
             while True:
                 tool_rounds += 1
                 if tool_rounds > MAX_TOOL_ROUNDS:
@@ -927,11 +1031,21 @@ def _run(agent_dir, model, api_key, base_url):
                         result = result[:MAX_TOOL_RESULT] + f"\n[...truncated at {MAX_TOOL_RESULT} chars, total {len(result)}]"
                     _log.info(f"[result] {tc.function.name} -> {result[:200]}")
                     history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                    if tc.function.name == "wait_input" and result == "ok:waiting":
+                        waited = True
                     if tc.function.name == "reply" and result == "ok":
                         replied = True
                 # After reply in a conn session, stop — don't waste an LLM call for finish=stop
                 if replied and session_id != "_heartbeat":
                     _log.info(f"[idle:{session_id}] replied, waiting for trigger")
+                    _sl.clear()
+                    break
+                # wait_input: rollback history, buffer input for next time
+                if waited:
+                    _log.info(f"[wait_input:{session_id}] buffering input, rollback history")
+                    session["history"] = history[:history_len_before]
+                    history = session["history"]
+                    session["wait_buffer"] = input_lines
                     _sl.clear()
                     break
                 if has_compact:
@@ -974,3 +1088,8 @@ def _run(agent_dir, model, api_key, base_url):
                     sess["socket"].close()
                 except OSError:
                     pass
+        for entry in lobby:
+            try:
+                entry["socket"].close()
+            except OSError:
+                pass
