@@ -216,6 +216,8 @@ async function pollChat() {
     const r = await fetch('/api/chat');
     const d = await r.json();
     const msgs = d.messages || [];
+    // Reset if server restarted (fewer messages than we tracked)
+    if (msgs.length < lastChatLen) lastChatLen = 0;
     for (let i = lastChatLen; i < msgs.length; i++) appendChat('ai', msgs[i]);
     lastChatLen = msgs.length;
   } catch(e) {}
@@ -348,40 +350,41 @@ def _parse_timeline(runtime_lines):
 
 class ChatBridge:
     """TCP bridge to physis for chat, with /resume support."""
+    MAX_MESSAGES = 200
+
     def __init__(self, physis_host, physis_port, session_id="web:monitor"):
         self.host = physis_host
         self.port = physis_port
-        self.sock = None
+        self._sock = None
         self.session_id = session_id
         self.messages = []
         self.lock = threading.Lock()
-        self.reader_thread = None
 
     def _ensure_connected(self):
-        if self.sock:
+        if self._sock:
             return True
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            self.sock.sendall(f"/resume {self.session_id}\n".encode())
-            self.reader_thread = threading.Thread(target=self._reader, daemon=True)
-            self.reader_thread.start()
+            s.connect((self.host, self.port))
+            s.sendall(f"/resume {self.session_id}\n".encode())
+            self._sock = s
+            threading.Thread(target=self._reader, args=(s,), daemon=True).start()
             return True
         except Exception as e:
-            self.sock = None
+            s.close()
             with self.lock:
                 self.messages.append(f"(connection failed: {e})")
             return False
 
-    def _reader(self):
+    def _reader(self, sock):
+        """Read from a specific socket. Exits when socket is closed or replaced."""
         buf = ""
         while True:
             try:
-                data = self.sock.recv(4096).decode("utf-8", errors="replace")
+                data = sock.recv(4096).decode("utf-8", errors="replace")
                 if not data:
                     with self.lock:
                         self.messages.append("(disconnected)")
-                    self.sock = None
                     break
                 buf += data
                 while "\n" in buf:
@@ -391,21 +394,34 @@ class ChatBridge:
                         continue
                     with self.lock:
                         self.messages.append(line)
+                        if len(self.messages) > self.MAX_MESSAGES:
+                            self.messages = self.messages[-self.MAX_MESSAGES:]
             except Exception:
                 with self.lock:
                     self.messages.append("(connection lost)")
-                self.sock = None
                 break
+        # Only clear _sock if it's still this socket (not already reconnected)
+        if self._sock is sock:
+            self._sock = None
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def send(self, message):
         if not self._ensure_connected():
             return
         try:
-            self.sock.sendall((message + "\n").encode())
+            self._sock.sendall((message + "\n").encode())
         except Exception as e:
             with self.lock:
                 self.messages.append(f"(send failed: {e})")
-            self.sock = None
+            if self._sock:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
 
     def get_messages(self):
         with self.lock:

@@ -1084,6 +1084,7 @@ def _run(agent_dir, model, api_key, base_url):
                     _log.warning(f"[warn] empty response (finish={finish}), skipping")
                     break
 
+                pre_tool_len = len(history)
                 history.append(assistant_msg)
 
                 if not msg.tool_calls:
@@ -1103,9 +1104,9 @@ def _run(agent_dir, model, api_key, base_url):
                     try:
                         args = json.loads(tc.function.arguments)
                     except json.JSONDecodeError as e:
-                        _log.warning(f"[tool] {tc.function.name}: bad arguments, skipping: {e}")
-                        history.append({"role": "tool", "tool_call_id": tc.id, "content": f"error: malformed arguments: {e}"})
-                        continue
+                        _log.warning(f"[tool] {tc.function.name}: bad JSON, will retry: {e}")
+                        del history[pre_tool_len:]  # rollback this round
+                        break
                     _sl.begin(session_id, tc.function.name)
                     _log.info(f"[tool] {tc.function.name}({tc.function.arguments[:200]})")
                     result = _execute(agent_dir, tc.function.name, args, sessions=sessions)
