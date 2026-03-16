@@ -788,6 +788,26 @@ def main():
     parser.add_argument("--dir", default=".", help="Agent directory (default: current)")
     args = parser.parse_args()
     agent_dir = args.dir
+
+    # Check if directory has non-physis files
+    if os.path.exists(agent_dir):
+        physis_dirs = {"memory", "skills", "tasks", "conversations"}
+        physis_files = {"runtime.log", "thought.log", "trace.jsonl"}
+        existing = set(os.listdir(agent_dir))
+        foreign = existing - physis_dirs - physis_files
+        if foreign and not existing & physis_dirs:
+            # Has files but no physis dirs — probably not a physis directory
+            print(f"Current directory has existing files: {', '.join(sorted(foreign)[:5])}")
+            print("physis will create memory/, skills/, tasks/ here.")
+            print("Recommended: run in an empty directory (e.g. mkdir my-agent && cd my-agent)")
+            try:
+                answer = input("Continue here? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(0)
+            if answer not in ("y", "yes"):
+                sys.exit(0)
+
     if args.inherit_from:
         source = os.path.abspath(args.inherit_from)
         os.makedirs(os.path.join(agent_dir, "memory"), exist_ok=True)
@@ -816,8 +836,12 @@ def run(agent_dir=".", model=None, api_key=None, base_url=None):
 
 def _run(agent_dir, model, api_key, base_url):
     _setup_logging(agent_dir)
+    resolved_key = api_key or os.environ.get("PHYSIS_API_KEY")
+    if not resolved_key:
+        print("Error: No API key. Set PHYSIS_API_KEY environment variable.", file=sys.stderr)
+        sys.exit(1)
     client = OpenAI(
-        api_key=api_key or os.environ.get("PHYSIS_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
+        api_key=resolved_key,
         base_url=base_url or os.environ.get("PHYSIS_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1"),
         timeout=180,
     )
